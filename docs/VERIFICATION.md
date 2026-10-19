@@ -1,5 +1,37 @@
 # Verification record
 
+## Counsel Note integration verification (2026-10-19)
+
+HDH source commit `3c6c2383f2cf22a0381520186be22318e4626cd8` was integrated
+into the original Counsel Note project. These checks are separate from the
+upstream NVIDIA verification below.
+
+- This PC: Windows, Python 3.12.10, Intel Arc 130V; no NVIDIA CUDA device.
+- The operational Python environment and Intel/OpenVINO default are preserved.
+  The HDH engine is optional; `worker_python` supports a separate speech runtime.
+- Isolated QA environment: Python 3.12.10, CPU PyTorch 2.8.0, Streamlit 1.66.0.
+  `pytest -q`: **40 passed in 13.43 seconds**; package/test Ruff checks passed.
+- Eight legacy check scripts passed: import contracts, log CSV batch state,
+  processing history, CSV persistence, CSV worker, five-worker Google Docs
+  ordering/recovery, audio batches and runtime stability. Their fake transports
+  did not write to real Google Docs or ADMIN services.
+- Real browser: the model-missing state disabled transcription; a synthetic
+  record allowed speaker labels and notes to be edited and saved. The original
+  transcript JSON stayed byte-identical. Desktop layout at 900 px was inspected;
+  DOM checks at 1440 px reported no horizontal overflow. The 390 px mobile view
+  was inspected and its document width matched its viewport width.
+- The browser fixture supplies synthetic transcript evidence, not an ASR result.
+  No real speech-model execution, diarization accuracy, counseling accuracy or
+  processing-speed improvement on this Intel PC is claimed.
+- No real recordings, student mappings, live ADMIN/Docs writes or Apps Script
+  deployments were used. Model access terms were not accepted and no access
+  tokens or model weights were acquired for this integration.
+- LSP remains unavailable because installation was previously declined. Tests,
+  Ruff and syntax checks are used instead; no LSP/type-check pass is claimed.
+- Earlier source-only end-of-file whitespace warnings remain outside this change.
+
+## Original HDH upstream verification
+
 Date: **2026-10-19**. No real counseling recordings, student registries, Google
 Docs writes, ADMIN writes, production servers or paid APIs were used.
 

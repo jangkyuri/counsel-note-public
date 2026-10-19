@@ -9242,7 +9242,7 @@ def initialize_draft_state() -> None:
         st.session_state.setdefault("author_name", get_default_author_name())
         st.session_state.setdefault("counseling_date", today_kst)
         st.session_state.setdefault("counseling_date_input", st.session_state["counseling_date"])
-        st.session_state.setdefault("selected_mode", "HDH 로컬 화자 전사")
+        st.session_state.setdefault("selected_mode", "GPU 터보 모드")
         st.session_state.setdefault("selected_summary_style", "기본 상담 정리")
         st.session_state.setdefault("transcript_text", "")
         st.session_state.setdefault("transcript_segments", [])

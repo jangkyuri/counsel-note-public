@@ -11,6 +11,7 @@
 
 # Python environments and caches
 .venv/
+.venv-hdh/
 .venv_broken_*/
 __pycache__/
 *.py[cod]

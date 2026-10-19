@@ -15,6 +15,12 @@ system firewall guarantee for arbitrary native code**. For strict isolation,
 add an outbound firewall rule for the dedicated Python executable after model
 preparation and validate it with synthetic audio.
 
+The optional `worker_python` setting selects a separate installed speech Python
+environment without replacing the operational app's interpreter or packages.
+Omitting it preserves the current interpreter. Relative interpreter paths are
+resolved against the configuration file, not the temporary worker directory.
+Install HDHcounsel and its speech dependencies in that environment before use.
+
 `pipeline.py` runs ASR, alignment and optional diarization sequentially. Each
 model is deleted before the next stage; the process boundary releases native
 allocations after each recording. The same 16 kHz mono waveform is supplied to

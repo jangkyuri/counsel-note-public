@@ -23,6 +23,7 @@ class Settings:
     num_speakers: int | None = None
     ffmpeg: str = ""
     timeout_seconds: int = 14400
+    worker_python: str = ""
 
     def __post_init__(self) -> None:
         if self.device not in {"cpu", "cuda"}:
@@ -42,6 +43,8 @@ class Settings:
             raise CounselError("timeout_seconds must be a positive integer.")
         if not isinstance(self.ffmpeg, str):
             raise CounselError("ffmpeg must be an executable path string.")
+        if not isinstance(self.worker_python, str):
+            raise CounselError("worker_python must be an executable path string.")
 
     @classmethod
     def load(cls, path: Path | None = None) -> Settings:
@@ -68,6 +71,11 @@ class Settings:
                 ).resolve()
             if values.get("device") == "cpu" and "compute_type" not in values:
                 values["compute_type"] = "int8"
+            if values.get("worker_python"):
+                worker = Path(values["worker_python"]).expanduser()
+                values["worker_python"] = str((
+                    worker if worker.is_absolute() else config_path.parent / worker
+                ).resolve())
             return cls(**values)
         except (TypeError, ValueError) as exc:
             raise CounselError("Configuration values have invalid types. Check hdhcounsel.example.toml.") from exc

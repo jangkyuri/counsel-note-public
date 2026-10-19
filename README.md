@@ -1,13 +1,16 @@
-# HDHcounsel
+# Counsel Note + HDHcounsel
 
 학생 상담 녹음을 **이 PC에서** 한국어로 전사하고 시간·화자·단어 근거와
-검수 기록을 남기는 Windows 중심 앱입니다. 새 기본 실행은 Google 설정,
-Codex 로그인, 유료 API가 필요 없습니다.
+검수 기록을 남기는 Windows 중심 앱입니다. 별도 HDHcounsel 검수 화면은 Google 설정,
+Codex 로그인, 유료 API가 필요 없습니다. 기존 `run_app.bat`의 ADMIN·Docs 흐름과
+Intel GPU용 `GPU 터보 모드` 기본값은 유지합니다.
 
 **원본:** [jangkyuri/counsel-note-public](https://github.com/jangkyuri/counsel-note-public),
 commit `47da11d`. 원본 소스와 이력을 보존했습니다. 원본에는 명시적인 라이선스가
-없으므로 임의로 MIT 등의 라이선스를 붙이지 않습니다. 재배포 조건을 확인하기
-전에는 이 저장소를 비공개로 유지하세요. [조사와 라이선스 상태](docs/UPSTREAM_REVIEW.md).
+없으므로 임의로 MIT 등의 라이선스를 붙이지 않습니다. HDH 기능은
+[HDHhhdhh/HDHcounsel](https://github.com/HDHhhdhh/HDHcounsel)의 `3c6c238`에서
+가져왔으며 작성자와 이력을 보존했습니다. [원본 조사 기록](docs/UPSTREAM_REVIEW.md)의
+비공개 게시·NVIDIA 환경 검증 설명은 해당 원본의 당시 기록입니다.
 
 ## 달라진 점
 
@@ -25,15 +28,17 @@ commit `47da11d`. 원본 소스와 이력을 보존했습니다. 원본에는 �
 
 ## Windows 설치
 
-Python **3.12 x64**와 최신 NVIDIA 드라이버를 사용하세요. 모델용 디스크 공간을
-충분히 확보합니다. RTX 4070 SUPER 12GB에서 낮은 배치로 시작하는 구성이며,
-화자 분리 정확도와 한국어 인명은 사람이 확인해야 합니다.
+HDH 엔진은 Python **3.12 x64** 기준입니다. 기존 `.venv`를 덮어쓰지 말고
+별도 `.venv-hdh`에 설치하세요. 아래 CUDA 설치는 NVIDIA GPU용입니다.
+Intel GPU는 CUDA로 사용할 수 없으므로 기존 OpenVINO 모드를 유지하거나,
+새 HDH 엔진에서 CPU/int8을 명시적으로 설정해야 합니다. 화자 분리 정확도와
+한국어 인명은 사람이 확인해야 합니다.
 
 ```powershell
-py -3.12 -I -m venv .venv
-.\.venv\Scripts\python.exe -I -m pip install torch==2.8.0 torchaudio==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
-.\.venv\Scripts\python.exe -I -m pip install -e ".[speech,dev,legacy]"
-.\.venv\Scripts\python.exe -I -m pip check
+py -3.12 -I -m venv .venv-hdh
+.\.venv-hdh\Scripts\python.exe -I -m pip install torch==2.8.0 torchaudio==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
+.\.venv-hdh\Scripts\python.exe -I -m pip install -e ".[speech,dev,legacy]"
+.\.venv-hdh\Scripts\python.exe -I -m pip check
 ```
 
 FFmpeg 실행 파일은 설치된 `imageio-ffmpeg`의 번들을 기본 사용합니다. 이미 PATH에
@@ -53,9 +58,9 @@ FFmpeg가 있으면 그것을 우선합니다. TorchCodec/pyannote 환경에 따
 2. 모델을 준비합니다. 토큰은 다운로드 접근에만 필요하며 음성을 전송하지 않습니다.
 
 ```powershell
-.\.venv\Scripts\python.exe -I -m hdhcounsel.cli prepare
+.\.venv-hdh\Scripts\python.exe -I -m hdhcounsel.cli prepare
 # 화자 분리 없이 먼저 점검하는 경우:
-.\.venv\Scripts\python.exe -I -m hdhcounsel.cli prepare --no-diarization
+.\.venv-hdh\Scripts\python.exe -I -m hdhcounsel.cli prepare --no-diarization
 ```
 
 모델 revision은 `models/manifest.json`에 기록합니다. 모델 파일은 Git에 올리지
@@ -65,7 +70,7 @@ FFmpeg가 있으면 그것을 우선합니다. TorchCodec/pyannote 환경에 따
 ## 실행과 검수
 
 ```powershell
-.\.venv\Scripts\python.exe -I -m hdhcounsel.cli ui
+.\.venv-hdh\Scripts\python.exe -I -m hdhcounsel.cli ui
 # 또는 run_hdhcounsel.bat
 ```
 
@@ -75,8 +80,8 @@ FFmpeg가 있으면 그것을 우선합니다. TorchCodec/pyannote 환경에 따
 작업 뒤 삭제하며 원본 파일은 수정하지 않습니다.
 
 ```powershell
-.\.venv\Scripts\python.exe -I -m hdhcounsel.cli transcribe "C:\recordings\sample.wav"
-.\.venv\Scripts\python.exe -I -m hdhcounsel.cli transcribe "C:\recordings\sample.wav" --no-diarization --cpu
+.\.venv-hdh\Scripts\python.exe -I -m hdhcounsel.cli transcribe "C:\recordings\sample.wav"
+.\.venv-hdh\Scripts\python.exe -I -m hdhcounsel.cli transcribe "C:\recordings\sample.wav" --no-diarization --cpu
 ```
 
 설정 예시는 `hdhcounsel.example.toml`입니다. 기본
@@ -85,11 +90,16 @@ FFmpeg가 있으면 그것을 우선합니다. TorchCodec/pyannote 환경에 따
 SPEAKER 번호는 파일별 군집이며 실제 학생/상담자를 자동 식별하지 않습니다.
 겹친 발화, 짧은 맞장구, 이름, 숫자는 원음을 대조하세요.
 
+기존 앱에서 `HDH 로컬 화자 전사`를 선택할 때 별도 실행 환경을 사용하려면
+로컬 설정의 `worker_python`에 `.venv-hdh\Scripts\python.exe`의 절대 경로를
+지정합니다. 모델 준비 전에는 이 모드를 선택하지 마세요. 독립 검수 화면은
+모델이 없으면 전사 시작을 비활성화하며 기존 상담 데이터에는 접근하지 않습니다.
+
 ## 검증
 
 ```powershell
-.\.venv\Scripts\python.exe -I -m pytest
-.\.venv\Scripts\python.exe -I -m ruff check hdhcounsel tests
+.\.venv-hdh\Scripts\python.exe -I -m pytest
+.\.venv-hdh\Scripts\python.exe -I -m ruff check hdhcounsel tests
 ```
 
 실제 실행 증거와 미검증 항목은 [검증 결과](docs/VERIFICATION.md)를 참조하세요.

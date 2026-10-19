@@ -11,3 +11,5 @@ diarize = true
 # CPU: device = "cpu", compute_type = "int8", batch_size = 1
 # ffmpeg = "C:/tools/ffmpeg/bin/ffmpeg.exe"
 timeout_seconds = 14400
+# Optional separate speech environment; relative to this configuration file.
+# worker_python = "C:/counsel-note/.venv-hdh/Scripts/python.exe"

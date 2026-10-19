@@ -33,7 +33,8 @@ def transcribe(source: Path, settings: Settings) -> Transcript:
             environment.pop(name, None)
         try:
             completed = subprocess.run(
-                [sys.executable, "-I", "-m", "hdhcounsel.worker", str(request), str(result)],
+                [settings.worker_python or sys.executable, "-I", "-m", "hdhcounsel.worker",
+                 str(request), str(result)],
                 cwd=work,
                 env=environment,
                 capture_output=True,
