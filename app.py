@@ -76,6 +76,7 @@ _check_startup_required_files()
 
 from counsel_modules.audio_batch_review import AudioBatchReviewActions, render_audio_batch_summary_review
 from counsel_modules.admin_note_merge import AdminSummaryMergeConflict, merge_admin_summary, normalized_admin_notes
+from counsel_modules import openai_processing
 from counsel_modules.audio_workflow_ui import audio_workflow_counts, render_audio_processing_log, render_audio_workflow_overview
 from counsel_modules.recording_backup_worker import (
     recording_backup_is_running, recording_backup_warning, request_recording_backup, retry_recording_backup,
@@ -7927,7 +7928,7 @@ def transcribe_audio_with_wav_preprocess(
 
 def transcribe_audio(
     audio_path: Path,
-    model: WhisperModel,
+    model: WhisperModel | None,
     beam_size: int,
     use_vad_filter: bool,
     student_name: str = "",
@@ -7935,6 +7936,20 @@ def transcribe_audio(
     processing_mode: str = "",
     progress_callback=None,
 ) -> tuple[str, list[dict[str, str]]]:
+    if model is None:
+        st.session_state["last_extract_debug_info"] = {}
+        result = openai_processing.transcribe(audio_path)
+        rows = [
+            {
+                "start": format_timestamp(segment.start),
+                "end": format_timestamp(segment.end),
+                "text": segment.text,
+                "speaker": segment.speaker,
+            }
+            for segment in result.segments
+        ]
+        return result.text, rows or [{"start": "-", "end": "-", "text": result.text}]
+
     from hdhcounsel.config import Settings
 
     if isinstance(model, Settings):
@@ -8301,7 +8316,7 @@ def generate_summary_from_transcript(
         summary_style,
         glossary_for_prompt,
     )
-    runner = summary_runner or run_codex_summary
+    runner = summary_runner or run_configured_summary
     attempts: list[dict[str, object]] = []
     max_attempts = max(1, int(max_invalid_retries or 0) + 1)
     last_normalized_summary = ""
@@ -8349,7 +8364,7 @@ def generate_summary_from_transcript(
     reason = str(diagnostics.get("invalid_reason") or "")
     error = WorkflowStepError(
         "정리본 생성",
-        "Codex가 유효한 정리본을 반환하지 않았습니다. "
+        f"{'OpenAI API' if openai_processing.openai_api_enabled() else 'Codex'}가 유효한 정리본을 반환하지 않았습니다. "
         f"사유: {summary_invalid_reason_label(reason)}. "
         "원문은 저장되어 있으나 정리본 복사는 하지 않았습니다.",
     )
@@ -8572,6 +8587,15 @@ def codex_login_status(executable: CodexExecutable | None = None) -> CodexLoginS
 
 
 def prepare_codex_summary_processing() -> bool:
+    if openai_processing.openai_api_enabled():
+        st.session_state["codex_login_required"] = False
+        try:
+            openai_processing.require_api_key()
+        except openai_processing.OpenAIProcessingError as exc:
+            st.session_state["post_run_warning"] = ""
+            st.session_state["post_run_error"] = str(exc)
+            return False
+        return True
     executable = _find_codex_executable()
     if executable is None:
         st.session_state["codex_login_required"] = False
@@ -8596,7 +8620,7 @@ def prepare_codex_summary_processing() -> bool:
 
 
 def render_codex_login_recovery(ui_locked: bool) -> None:
-    if not st.session_state.get("codex_login_required"):
+    if openai_processing.openai_api_enabled() or not st.session_state.get("codex_login_required"):
         return
     st.info("Codex에 다시 로그인한 뒤 정리하고 ADMIN 저장을 누르면 저장된 작업부터 이어집니다.")
     if not st.button("Codex 로그인 열기", disabled=ui_locked, key="open_codex_login"):
@@ -8615,6 +8639,15 @@ def render_codex_login_recovery(ui_locked: bool) -> None:
         st.error(f"Codex 로그인 창을 열지 못했습니다: {exc}")
         return
     st.success("열린 창에서 로그인을 완료한 뒤 정리하고 ADMIN 저장을 다시 누르세요.")
+
+
+def run_configured_summary(prompt: str) -> str:
+    if not openai_processing.openai_api_enabled():
+        return run_codex_summary(prompt)
+    try:
+        return openai_processing.summarize(prompt, instructions=CODEX_INSTRUCTION)
+    except openai_processing.OpenAIProcessingError as exc:
+        raise WorkflowStepError("정리본 생성", str(exc)) from exc
 
 
 def run_codex_summary(prompt: str) -> str:
@@ -9462,6 +9495,11 @@ def is_codex_network_error(error: object) -> bool:
 
 
 def should_pause_audio_batch_for_codex_error(error: object) -> bool:
+    cause = error
+    while isinstance(cause, BaseException):
+        if isinstance(cause, openai_processing.OpenAIProcessingError):
+            return cause.pause_batch
+        cause = cause.__cause__
     return (
         is_codex_usage_limit_error(error)
         or is_codex_authentication_error(error)
@@ -9748,7 +9786,7 @@ def set_troubleshooting_info(
         "stdout": "-",
         "stderr": "-",
         "실행 명령": "-",
-        "Codex 실행 경로": find_codex_executable().get("path") or "-",
+        "Codex 실행 경로": "-" if openai_processing.openai_api_enabled() else find_codex_executable().get("path") or "-",
         "원문 저장 경로": str(transcript_path_value or "-"),
         "업로드 파일 경로": str(selected_audio_path or "-"),
         "원문 글자 수": len(st.session_state.get("transcript_text") or st.session_state.get("rejected_transcript_text") or ""),
@@ -10533,7 +10571,7 @@ def main() -> None:
         elif selected_audio_path:
             st.session_state["student_name_detection_message"] = "파일명에서 학생명을 찾지 못했습니다. 직접 입력하세요."
 
-        if selected_audio_path and is_m4a_or_mp3(selected_audio_path) and not has_ffmpeg():
+        if selected_audio_path and is_m4a_or_mp3(selected_audio_path) and not openai_processing.openai_api_enabled() and not has_ffmpeg():
             st.warning(ffmpeg_missing_audio_warning())
 
         can_run = bool(student_name.strip()) and selected_audio_label is not None and not has_blocking_startup_issue
@@ -10715,7 +10753,7 @@ def main() -> None:
                 update_progress("모델 로딩", "진행 중", "모델 로딩 중")
                 model_status_placeholder.caption("모델 로딩 중...")
                 try:
-                    model = load_whisper_model(model_size, compute_type)
+                    model = None if openai_processing.openai_api_enabled() else load_whisper_model(model_size, compute_type)
                 except Exception as exc:
                     raise WorkflowStepError("원문 추출", str(exc)) from exc
                 model_elapsed = time.monotonic() - model_started_at
@@ -10767,7 +10805,7 @@ def main() -> None:
                     elapsed_text = format_elapsed(time.monotonic() - extraction_started_at)
                     extraction_status_placeholder.caption(f"원문 추출 실패 · {elapsed_text} 경과")
                     ffmpeg_hint = ""
-                    if is_m4a_or_mp3(audio_path) and not has_ffmpeg():
+                    if model is not None and is_m4a_or_mp3(audio_path) and not has_ffmpeg():
                         ffmpeg_hint = " m4a/mp3 파일 처리에는 ffmpeg가 필요할 수 있습니다. ffmpeg 설치 후 앱을 재시작해보세요."
                     extract_debug = st.session_state.get("last_extract_debug_info") or {}
                     actual_type = extract_debug.get("exception_type") or type(exc).__name__
@@ -10809,7 +10847,7 @@ def main() -> None:
                 if suspicion_reason:
                     retry_without_vad = False
                     retry_suspicion_reason = ""
-                    if use_vad_filter or use_prompt_hint:
+                    if model is not None and (use_vad_filter or use_prompt_hint):
                         try:
                             retry_transcript, retry_segment_rows = transcribe_audio(
                                 audio_path,
@@ -11006,6 +11044,9 @@ def main() -> None:
                     if exc.stage == "정리본 생성":
                         pause_audio_batch = should_pause_audio_batch_for_codex_error(exc)
                         batch_item_status = "pending" if pause_audio_batch else "needs_review"
+                    elif openai_processing.openai_api_enabled() and should_pause_audio_batch_for_codex_error(exc):
+                        pause_audio_batch = True
+                        batch_item_status = "pending"
                     else:
                         batch_item_status = "failed"
                     batch_item_detail = str(exc).splitlines()[0][:160]
