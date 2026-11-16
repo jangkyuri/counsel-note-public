@@ -18,9 +18,22 @@ class AudioBatchReviewActions:
     download_text: Callable[[AudioBatchState], str]
 
 
+@st.fragment
 def render_audio_batch_summary_review(
     state: AudioBatchState, ui_locked: bool, actions: AudioBatchReviewActions,
 ) -> None:
+    choice_key = "audio_batch_summary_choice"
+    restore_key = "audio_batch_summary_restore_choice"
+    if "audio_batch_state" in st.session_state:
+        current: AudioBatchState | None = st.session_state["audio_batch_state"]
+        if current is None or current.get("acknowledged_at"):
+            st.session_state.pop(restore_key, None)
+            return
+        if current != state:
+            # A fragment escalated before widget rendering can lose widget-owned keys.
+            st.session_state[restore_key] = st.session_state.get(choice_key)
+            st.rerun(scope="app")
+            return
     jobs = [job for job in state["jobs"] if job["summary"].strip() or (
         job["transcript_path"] and job["status"] == "needs_review"
     )]
@@ -28,7 +41,9 @@ def render_audio_batch_summary_review(
         st.caption("아직 완료된 정리본이 없습니다.")
         return
     job_ids = [job["job_id"] for job in jobs]
-    choice_key = "audio_batch_summary_choice"
+    restored_choice = st.session_state.pop(restore_key, None)
+    if restored_choice in job_ids:
+        st.session_state[choice_key] = restored_choice
     if st.session_state.get(choice_key) not in job_ids:
         st.session_state[choice_key] = job_ids[0]
     position = job_ids.index(st.session_state[choice_key])
@@ -65,8 +80,13 @@ def render_audio_batch_summary_review(
     st.session_state[widget_key] = selected["summary"]
 
     def persist_edit() -> None:
-        current = st.session_state["audio_batch_state"]
-        job = next(item for item in current["jobs"] if item["job_id"] == selected["job_id"])
+        current: AudioBatchState | None = st.session_state.get("audio_batch_state")
+        # A queued edit can arrive after completion confirmation retires the batch.
+        if current is None or current.get("acknowledged_at"):
+            return
+        job = next((item for item in current["jobs"] if item["job_id"] == selected["job_id"]), None)
+        if job is None:
+            return
         summary = format_summary_section_spacing(st.session_state[widget_key])
         if summary != job["summary"]:
             updated = update_audio_batch_job(
@@ -81,4 +101,4 @@ def render_audio_batch_summary_review(
     actions.render_target(selected)
     st.download_button("완료 정리본 묶음 다운로드", data=actions.download_text(state).encode("utf-8-sig"),
                        file_name=f"5A_정리본_일괄_{selected['counseling_date']}.txt", mime="text/plain",
-                       width="stretch")
+                       width="stretch", on_click="ignore")

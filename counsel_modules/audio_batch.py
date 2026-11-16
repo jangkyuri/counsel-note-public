@@ -35,6 +35,7 @@ class AudioBatchJob(TypedDict):
     updated_at: str
     admin_saved: NotRequired[bool]
     admin_sid: NotRequired[str]
+    admin_saved_export: NotRequired[str]
 
 
 class AudioBatchState(TypedDict):
@@ -111,6 +112,7 @@ def create_audio_batch_job(
         "updated_at": "",
         "admin_saved": False,
         "admin_sid": "",
+        "admin_saved_export": "",
     }
 
 
@@ -168,6 +170,8 @@ def update_audio_batch_job(
             job["detail"] = detail
             job["transcript_path"] = transcript_path
             if summary != job["summary"]:
+                if job.get("admin_saved") and not job.get("admin_saved_export"):
+                    job["admin_saved_export"] = job["summary"]
                 job["admin_saved"] = False
             job["summary"] = summary
             job["updated_at"] = updated_at
@@ -290,7 +294,7 @@ def prepare_audio_batch_retry(state: AudioBatchState, updated_at: str) -> AudioB
     jobs: list[AudioBatchJob] = []
     for current in state["jobs"]:
         job = current.copy()
-        if job["status"] in {"failed", "needs_review"}:
+        if job["status"] in {"failed", "needs_review"} or (job["status"] == "completed" and not job.get("admin_saved")):
             job["status"] = "pending"
             job["detail"] = "문제 파일 다시 처리 대기 중"
             job["updated_at"] = updated_at
@@ -341,6 +345,7 @@ def load_audio_batch_state(path: Path) -> AudioBatchState | None:
                     "updated_at": str(raw_job.get("updated_at", "")),
                     "admin_saved": raw_job.get("admin_saved") is True,
                     "admin_sid": str(raw_job.get("admin_sid", "")),
+                    "admin_saved_export": str(raw_job.get("admin_saved_export", "")),
                 }
             )
         raw_status = str(payload.get("status", "paused"))

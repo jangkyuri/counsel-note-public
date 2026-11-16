@@ -11,7 +11,8 @@ import subprocess
 import sys
 import time
 import traceback
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -30,6 +31,11 @@ _STARTUP_REQUIRED_FILES = [
     "counsel_modules/__init__.py",
     "counsel_modules/audio_batch.py",
     "counsel_modules/audio_batch_review.py",
+    "counsel_modules/recording_drive_backup.py",
+    "counsel_modules/recording_backup_worker.py",
+    "counsel_modules/recording_verified_cleanup.py",
+    "counsel_modules/recording_cleanup_files.py",
+    "counsel_modules/recording_recycle.py",
     "counsel_modules/codex_runner.py",
     "counsel_modules/codex_runtime.py",
     "counsel_modules/log_csv_batch_state.py",
@@ -69,10 +75,17 @@ _check_startup_required_files()
 
 
 from counsel_modules.audio_batch_review import AudioBatchReviewActions, render_audio_batch_summary_review
+from counsel_modules.admin_note_merge import AdminSummaryMergeConflict, merge_admin_summary, normalized_admin_notes
+from counsel_modules.audio_workflow_ui import audio_workflow_counts, render_audio_processing_log, render_audio_workflow_overview
+from counsel_modules.recording_backup_worker import (
+    recording_backup_is_running, recording_backup_warning, request_recording_backup, retry_recording_backup,
+    request_recording_cleanup,
+)
 from counsel_modules.log_csv_saved_students import confirmed_students_from_history_export
 from counsel_modules.log_csv_recheck import (
     LogCsvRecheckActions, LogCsvStorageCheck, LogCsvStorageResponse,
-    classify_log_csv_storage_check, render_completed_log_csv_recheck,
+    classify_log_csv_storage_check, log_csv_recheck_indices, render_completed_log_csv_recheck,
+    verify_log_csv_storage_candidates,
 )
 from counsel_modules.log_csv_utils import (
     LOG_EXPORT_CONTENT_COLUMNS,
@@ -111,6 +124,7 @@ from counsel_modules.log_csv_worker import (
     start_csv_worker,
 )
 from counsel_modules.log_csv_processing_history import (
+    LogCsvHistoryEntry,
     LogCsvHistoryOutcome,
     LogCsvHistoryStart,
     LogCsvHistoryUpdate,
@@ -270,6 +284,13 @@ class GoogleDocsLockTimeoutError(WorkflowStepError):
 
 
 @dataclass(frozen=True, slots=True)
+class AdminStudentsLookup:
+    base_url: str
+    started_at: float
+    future: Future[list[dict[str, str]]]
+
+
+@dataclass(frozen=True, slots=True)
 class LocalLogCsvUpload:
     path: Path
 
@@ -295,6 +316,8 @@ class AdminNotesSyncRequest:
     export_source_label: str
     today_focus_text: str
     preview_key: str
+    preserve_existing_notes: bool = False
+    previous_export_text: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -572,11 +595,69 @@ def apply_ui_refresh_styles() -> None:
         """
         <style>
           [data-testid="stElementContainer"] { transition: none !important; }
+          .st-key-audio-details textarea,
+          .st-key-audio-details [data-testid="stCaptionContainer"],
+          .st-key-audio-details [data-testid="stCaptionContainer"] p,
+          .st-key-audio-overview p { word-break: keep-all; overflow-wrap: anywhere; }
           [data-testid="stElementContainer"][data-stale="true"],
           [data-testid="stExpander"] > details,
           [data-testid="stExpander"] > details > summary {
             opacity: 1 !important;
             transition: none !important;
+          }
+          [data-testid="stButton"] button,
+          [data-testid="stDownloadButton"] button,
+          [data-testid="stPopover"] button {
+            transition: border-color 100ms ease, box-shadow 100ms ease, transform 70ms ease-out;
+          }
+          [data-testid="stButton"] button:not(:disabled):hover,
+          [data-testid="stDownloadButton"] button:not(:disabled):hover,
+          [data-testid="stPopover"] button:not(:disabled):hover {
+            border-color: var(--primary-color, #ff4b4b);
+            box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+          }
+          [data-testid="stButton"] button:not(:disabled):active,
+          [data-testid="stDownloadButton"] button:not(:disabled):active,
+          [data-testid="stPopover"] button:not(:disabled):active {
+            transform: translateY(1px);
+            box-shadow: inset 0 1px 2px rgba(0,0,0,0.12);
+          }
+          [data-testid="stButton"] button:focus-visible,
+          [data-testid="stDownloadButton"] button:focus-visible,
+          [data-testid="stPopover"] button:focus-visible {
+            outline: 2px solid var(--primary-color, #ff4b4b);
+            outline-offset: 2px;
+          }
+          [data-testid="stApp"]:is([data-test-script-state="running"],
+              [data-test-script-state="rerunRequested"])[data-test-connection-state="CONNECTED"]::after {
+            content: "";
+            position: fixed;
+            z-index: 1000001;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 2px;
+            background: #5f8796;
+            pointer-events: none;
+            opacity: 0;
+            animation: connect-log-busy-reveal 0s 200ms forwards;
+          }
+          [data-testid="stApp"]:is([data-test-script-state="running"],
+              [data-test-script-state="rerunRequested"])[data-test-connection-state="CONNECTED"]
+              [data-testid="stButton"] button:not(:disabled):focus {
+            cursor: progress;
+            box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary-color, #ff4b4b) 24%, transparent);
+          }
+          @keyframes connect-log-busy-reveal {
+            to { opacity: 1; }
+          }
+          @media (prefers-reduced-motion: reduce) {
+            [data-testid="stButton"] button,
+            [data-testid="stDownloadButton"] button,
+            [data-testid="stPopover"] button {
+              transition: none !important;
+              transform: none !important;
+            }
           }
         </style>
         """
@@ -584,10 +665,26 @@ def apply_ui_refresh_styles() -> None:
 
 
 def apply_korean_text_input_hints() -> None:
+    static_js = Path(st.__file__).parent / "static" / "static" / "js"
+    upload_assets = [
+        f"/static/js/{path.name}"
+        for pattern in ("axios.*.js", "FileUploader.*.js")
+        for path in sorted(static_js.glob(pattern))
+    ]
     components.html(
         """
         <script>
         (() => {
+          const uploadAssets = __UPLOAD_ASSETS__;
+          const parentDoc = window.parent.document;
+          for (const href of uploadAssets) {
+            if (parentDoc.querySelector(`link[data-connectlog-upload-asset][href="${href}"]`)) continue;
+            const link = parentDoc.createElement("link");
+            link.rel = "modulepreload";
+            link.href = href;
+            link.setAttribute("data-connectlog-upload-asset", "");
+            parentDoc.head.appendChild(link);
+          }
           const labels = new Set(["학생명", "작성자"]);
           const apply = () => {
             const doc = window.parent.document;
@@ -608,7 +705,7 @@ def apply_korean_text_input_hints() -> None:
           new MutationObserver(apply).observe(window.parent.document.body, { childList: true, subtree: true });
         })();
         </script>
-        """,
+        """.replace("__UPLOAD_ASSETS__", json.dumps(upload_assets)),
         height=0,
     )
 
@@ -1103,6 +1200,7 @@ def append_summary_to_google_doc(
     subject: str | None = None,
     book: str | None = None,
     post_request=None,
+    preserve_existing_sections: bool = False,
 ) -> dict[str, object]:
     cleaned_web_app_url = clean_google_apps_script_url(web_app_url)
     validate_google_apps_script_url(cleaned_web_app_url)
@@ -1131,6 +1229,8 @@ def append_summary_to_google_doc(
 
     payload = {
         "student_name": student_name.strip(),
+        "subject": normalize_log_csv_subject(subject),
+        "preserve_existing_sections": preserve_existing_sections,
         "counseling_date": counseling_date_value.isoformat(),
         "summary": summary_for_google_docs,
         "doc_id": doc_id.strip(),
@@ -1213,6 +1313,7 @@ def verify_summary_in_google_doc_after_timeout(
     subject: str | None = None,
     book: str | None = None,
     post_request=None,
+    preserve_existing_sections: bool = False,
 ) -> dict[str, object]:
     cleaned_web_app_url = clean_google_apps_script_url(web_app_url)
     try:
@@ -1262,6 +1363,8 @@ def verify_summary_in_google_doc_after_timeout(
         "action": "verify_existing",
         "verify_only": True,
         "student_name": student_name.strip(),
+        "subject": normalize_log_csv_subject(subject),
+        "preserve_existing_sections": preserve_existing_sections,
         "counseling_date": counseling_date_value.isoformat(),
         "summary": summary_for_google_docs,
         "doc_id": doc_id.strip(),
@@ -1397,26 +1500,15 @@ def persist_current_log_csv_processing_history(history: LogCsvProcessingHistory)
     return True
 
 
-def log_csv_legacy_batch_source_matches(
-    state: LogCsvBatchState | None,
-    uploaded_log_csv: object,
-) -> bool:
-    if state is None or not isinstance(uploaded_log_csv, LocalLogCsvUpload):
-        return False
-    source_path_text = str(state.get("source_csv_path") or "").strip()
-    source_mtime_ns = int(state.get("source_mtime_ns") or 0)
-    if not source_path_text or source_mtime_ns <= 0:
-        return False
-    try:
-        source_path = Path(source_path_text)
-        source_stat = source_path.stat()
-        return bool(
-            source_path.resolve() == uploaded_log_csv.path.resolve()
-            and source_stat.st_mtime_ns == source_mtime_ns
-            and int(state.get("source_csv_size") or 0) == uploaded_log_csv.size
-        )
-    except OSError:
-        return False
+def log_csv_workspace_signature(uploaded_log_csv, log_rows, matched_rows) -> str:
+    # A displayed row index can shift when a Docs mapping makes two rows merge.
+    targets = [(
+        log_csv_history_source_indices(item),
+        sorted(str(match.get("doc_id") or match.get("doc_url") or "") for match in item.get("docs_matches") or []),
+        str((item.get("applied_subject_info") or {}).get("applied_subject") or ""),
+    ) for item in matched_rows]
+    source = ("v2", getattr(uploaded_log_csv, "name", ""), getattr(uploaded_log_csv, "size", 0), log_rows, targets)
+    return hashlib.sha256(json.dumps(source, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:24]
 
 
 def log_csv_history_source_indices_for_matches(
@@ -1527,6 +1619,17 @@ def load_log_csv_history_export(path_text: str, mtime_ns: int, size: int) -> tup
     return csv_bytes_sha256(raw), rows
 
 
+@st.cache_data(show_spinner=False, max_entries=256)
+def cached_confirmed_students_from_history_export(
+    csv_hash: str, history_hash: str, docs_hash: str,
+    _entry: LogCsvHistoryEntry, _rows: list[dict[str, str]], _docs_rows: list[dict[str, str]],
+) -> set[tuple[str, str]] | None:
+    """Reuse pure matching only for verified source bytes, history and mappings."""
+    # All semantic inputs have content hashes computed by the caller.
+    del csv_hash, history_hash, docs_hash
+    return confirmed_students_from_history_export(_entry, _rows, _docs_rows)
+
+
 def current_log_csv_saved_student_keys() -> set[tuple[str, str]] | None:
     saved_students: set[tuple[str, str]] = set()
     try:
@@ -1544,6 +1647,9 @@ def current_log_csv_saved_student_keys() -> set[tuple[str, str]] | None:
     if history:
         entries = {entry["csv_hash"]: entry for entry in history["entries"]}
         docs_rows = load_google_docs_map_rows()
+        docs_hash = hashlib.sha256(json.dumps(
+            docs_rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
         for path in default_log_csv_downloads_dir().glob("수업기록_*.csv"):
             if not LOG_CSV_DOWNLOAD_NAME_PATTERN.fullmatch(path.name):
                 continue
@@ -1554,7 +1660,12 @@ def current_log_csv_saved_student_keys() -> set[tuple[str, str]] | None:
                 continue
             entry = entries.get(csv_hash)
             if entry:
-                recovered = confirmed_students_from_history_export(entry, rows, docs_rows)
+                history_hash = hashlib.sha256(json.dumps(
+                    entry, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                ).encode("utf-8")).hexdigest()
+                recovered = cached_confirmed_students_from_history_export(
+                    csv_hash, history_hash, docs_hash, _entry=entry, _rows=rows, _docs_rows=docs_rows,
+                )
                 if recovered is None:
                     unverified_days.add(entry["source_date"])
                 else:
@@ -1581,7 +1692,8 @@ def render_log_csv_processing_history_summary(
         status_label = "완료" if day_summary["status"] == "completed" else "미완료"
         _timestamp_date, time_text = format_log_csv_history_time(day_summary["updated_at"])
         if not day_summary["has_history"]:
-            time_text = "미처리"
+            status_label = "미처리"
+            time_text = ""
         if saved_students is None:
             count_text = "인원 확인 필요"
         else:
@@ -1954,6 +2066,13 @@ def render_log_csv_auto_import_watcher() -> None:
 
 def admin_consumed_filter_enabled() -> bool:
     return bool(st.session_state.get("admin_consumed_filter_enabled", True))
+
+
+@st.fragment(run_every="500ms")
+def render_log_csv_admin_lookup_watcher() -> None:
+    lookup = st.session_state.get("log_csv_admin_lookup")
+    if lookup is not None and lookup.future.done():
+        st.rerun()
 
 
 def _admin_consumed_note_preview(value: object, max_length: int = 60) -> str:
@@ -4488,6 +4607,7 @@ def admin_source_notes_for_log_item(item: dict[str, object]) -> str:
 
 def prepare_log_csv_preview_for_google_docs(
     item: dict[str, object], *, consumed_filter_enabled: bool | None = None,
+    consumed_registry: dict[str, object] | None = None,
 ) -> str:
     row = item["source_row"]
     applied_subject_info = item.get("applied_subject_info") or {}
@@ -4507,6 +4627,7 @@ def prepare_log_csv_preview_for_google_docs(
         enabled=admin_consumed_filter_enabled() if consumed_filter_enabled is None else consumed_filter_enabled,
         admin_source_notes=admin_source_notes_for_log_item(item),
         counseling_date=row.get("date") or row.get("counseling_date"),
+        registry=consumed_registry,
     )
     item["admin_consumed_docs_filter_diagnostic"] = filter_result.get("diagnostic", {})
     removed_notes = [str(note) for note in filter_result.get("removed_notes", [])]
@@ -4516,6 +4637,19 @@ def prepare_log_csv_preview_for_google_docs(
             _admin_consumed_note_preview(note) for note in removed_notes[:3]
         )
     return str(filter_result.get("filtered_text") or prepared_text)
+
+
+def prepare_log_csv_previews_for_google_docs(
+    items: list[dict[str, object]], *, consumed_filter_enabled: bool,
+) -> list[str]:
+    registry = load_consumed_admin_notes() if consumed_filter_enabled else None
+    return [
+        prepare_log_csv_preview_for_google_docs(
+            item, consumed_filter_enabled=consumed_filter_enabled,
+            consumed_registry=registry,
+        )
+        for item in items
+    ]
 
 
 def google_docs_summary_progress_diagnostic(item: dict[str, object], docs_summary: str) -> str:
@@ -4721,14 +4855,39 @@ def execute_log_csv_transfer(
         return f"source:{selected_index}"
 
     def send_docs_request(request_data, verify_only):
-        try:
-            if verify_only:
-                raise GoogleDocsPostIndeterminateError(
-                    "Google Docs 저장 확인",
-                    "이전 실행의 전송 결과를 먼저 확인합니다.",
-                )
-            try:
-                result = append_summary_to_google_doc(
+        error = GoogleDocsPostIndeterminateError(
+            "Google Docs 저장 확인", "문서의 실제 저장 결과를 확인합니다.",
+        )
+        result = None
+        verification = {}
+        for write_attempt in range(2):
+            if not verify_only:
+                try:
+                    result = append_summary_to_google_doc(
+                        web_app_url,
+                        request_data["student_name"],
+                        parse_log_export_date(request_data["counseling_date"]),
+                        request_data["summary"],
+                        request_data["doc_id"],
+                        dedupe_key=request_data["dedupe_key"],
+                        subject=request_data["subject"],
+                        book=request_data["book"],
+                        post_request=docs_post_request,
+                        preserve_existing_sections=True,
+                    )
+                except WorkflowStepError as exc:
+                    result = None
+                    error = GoogleDocsPostIndeterminateError("Google Docs 저장 확인", str(exc))
+                else:
+                    if result.get("skipped_no_write") is True:
+                        return result, None, None
+
+            # Readback is required even for a successful response. An unavailable
+            # read is not evidence of absence and must never authorize a write.
+            for verify_attempt in range(3):
+                if result is None or verify_attempt:
+                    time.sleep(GOOGLE_DOCS_TIMEOUT_VERIFY_PAUSE_SECONDS)
+                verification = verify_summary_in_google_doc_after_timeout(
                     web_app_url,
                     request_data["student_name"],
                     parse_log_export_date(request_data["counseling_date"]),
@@ -4738,35 +4897,32 @@ def execute_log_csv_transfer(
                     subject=request_data["subject"],
                     book=request_data["book"],
                     post_request=docs_post_request,
+                    preserve_existing_sections=True,
                 )
-            except GoogleDocsLockTimeoutError:
-                time.sleep(lock_retry_pause_seconds)
-                result = append_summary_to_google_doc(
-                    web_app_url,
-                    request_data["student_name"],
-                    parse_log_export_date(request_data["counseling_date"]),
-                    request_data["summary"],
-                    request_data["doc_id"],
-                    dedupe_key=request_data["dedupe_key"],
-                    subject=request_data["subject"],
-                    book=request_data["book"],
-                    post_request=docs_post_request,
+                confirmed_read = verification.get("ok") is True and verification.get("verify_only") is True
+                if confirmed_read and verification.get("found_existing") is True:
+                    return (result, verification, None) if result is not None else (None, verification, error)
+                missing = (
+                    confirmed_read and verification.get("found_existing") is False
+                    and not is_truthy_result_value(verification.get("needs_review"))
+                    and not is_truthy_result_value(verification.get("skipped_no_write"))
+                    and not is_truthy_result_value(verification.get("duplicate_skipped"))
+                    and not verification.get("review_category")
+                    and not verification.get("error_type")
+                    and not (result and is_truthy_result_value(result.get("needs_review")))
                 )
-            return result, None, None
-        except (GoogleDocsPostTimeoutError, GoogleDocsPostIndeterminateError, GoogleDocsLockTimeoutError) as exc:
-            time.sleep(GOOGLE_DOCS_TIMEOUT_VERIFY_PAUSE_SECONDS)
-            verification = verify_summary_in_google_doc_after_timeout(
-                web_app_url,
-                request_data["student_name"],
-                parse_log_export_date(request_data["counseling_date"]),
-                request_data["summary"],
-                request_data["doc_id"],
-                dedupe_key=request_data["dedupe_key"],
-                subject=request_data["subject"],
-                book=request_data["book"],
-                post_request=docs_post_request,
-            )
-            return None, verification, exc
+                if missing:
+                    break
+                classification = classify_google_docs_timeout_verification(verification)
+                if classification.get("failure") or verification.get("needs_review"):
+                    return None, verification, error
+            if not missing:
+                return None, verification, error
+            if write_attempt == 1:
+                raise WorkflowStepError("Google Docs 저장 확인", "자동 재시도 후에도 문서에서 해당 기록을 확인하지 못했습니다.")
+            verify_only = False
+            time.sleep(lock_retry_pause_seconds)
+        raise AssertionError("Docs recovery attempts exhausted without a result")
 
     def parallel_transfers():
         nonlocal docs_posted_row_count, failure_count, run_state
@@ -4840,6 +4996,7 @@ def execute_log_csv_transfer(
                         "dedupe_key": dedupe_key,
                         "subject": str(applied_subject_info.get('applied_subject') or row.get('curriculum') or ''),
                         "book": google_docs_book_from_log_item(item),
+                        "preserve_existing_sections": "true",
                     }
                     prepared.append({
                         "selected_index": selected_index,
@@ -4869,11 +5026,14 @@ def execute_log_csv_transfer(
                 for transfer in prepared:
                     selected_index = transfer["selected_index"]
                     previous_request = previous_requests.get(selected_index)
-                    transfer["verify_only"] = previous_request is not None
+                    transfer["verify_only"] = previous_request is not None or retry_run_active or bool(transfer["retry_source_status"])
                     if previous_request is not None:
                         transfer["request_data"] = dict(
                             previous_request.get("request") or transfer["request_data"]
                         )
+                        transfer["request_data"]["preserve_existing_sections"] = "true"
+                        previous_request["request"] = transfer["request_data"]
+                        transfer["final_docs_summary"] = transfer["request_data"]["summary"]
                     else:
                         new_in_flight.append({
                             "source_index": selected_index,
@@ -4938,13 +5098,14 @@ def execute_log_csv_transfer(
                 dedupe_key_stale = result.get('dedupe_key_stale', '')
                 updated_existing = result.get('updated_existing') is True or result_message in {'updated_existing_progress_only', 'updated_existing_format_only', 'updated_existing_same_date'}
                 duplicate_skipped = result.get('duplicate_skipped') is True or result_message.startswith('duplicate_skipped') or result_message == 'similar_record_needs_review'
+                skipped_no_write = result.get('skipped_no_write') is True
                 normalized_duplicate_skipped = duplicate_skipped and (duplicate_reason == 'normalized_content' or result_message == 'duplicate_skipped_by_normalized_content')
-                status = '기존 기록 업데이트' if updated_existing else '중복으로 추가하지 않음' if duplicate_skipped else '성공'
+                status = '확인 필요' if skipped_no_write else '기존 기록 업데이트' if updated_existing else '중복으로 추가하지 않음' if duplicate_skipped else '성공'
                 if updated_existing:
                     updated_existing_count += 1
                 elif status == '중복으로 추가하지 않음':
                     already_saved_count += 1
-                else:
+                elif not skipped_no_write:
                     success_count += 1
                 added_row = result.get('added_row', '')
                 copied_row_template = result.get('copied_row_template', '')
@@ -4959,8 +5120,8 @@ def execute_log_csv_transfer(
                 copied_row_template_failed = added_row_needs_review and is_false_result_value(copied_row_template)
                 style_template_failed = is_false_result_value(style_template_used)
                 style_source_fallback = google_docs_style_source_needs_review(style_template_source)
-                review_candidate = not duplicate_skipped and (not added_row_style_success) and (is_truthy_result_value(needs_review) or stale_dedupe_needs_review or google_docs_review_reason_needs_review(review_reason) or copied_row_template_failed or style_template_failed or (added_row_needs_review and (not str(copied_row_template or '').strip())) or (added_row_needs_review and (not str(style_template_used or '').strip())) or (added_row_needs_review and (not str(style_template_source or '').strip())) or style_source_fallback)
-                review_category = 'needs_review' if review_candidate else ''
+                review_candidate = skipped_no_write or (not duplicate_skipped and (not added_row_style_success) and (is_truthy_result_value(needs_review) or stale_dedupe_needs_review or google_docs_review_reason_needs_review(review_reason) or copied_row_template_failed or style_template_failed or (added_row_needs_review and (not str(copied_row_template or '').strip())) or (added_row_needs_review and (not str(style_template_used or '').strip())) or (added_row_needs_review and (not str(style_template_source or '').strip())) or style_source_fallback))
+                review_category = str(result.get('review_category') or 'needs_review') if skipped_no_write else 'needs_review' if review_candidate else ''
                 if stale_dedupe_needs_review:
                     review_category = 'stale_dedupe_key_review'
                 if added_row_needs_review:
@@ -4993,7 +5154,7 @@ def execute_log_csv_transfer(
                     review_reason = add_google_docs_review_reason(review_reason, '문서 안에 같은 날짜의 유사 기록이 있으나 진도 외의 차이가 있어 자동 업데이트하지 않았습니다. 기존 기록과 새 기록을 확인하세요.')
                 if review_candidate:
                     needs_review_count += 1
-                results.append(build_log_csv_to_docs_result_entry(row, status, str(result_message or result.get('status') or '-'), doc_url=doc_url, doc_id=doc_id, dedupe_key=dedupe_key, duplicate_reason=duplicate_reason, dedupe_key_stale=dedupe_key_stale, updated_existing=updated_existing, already_saved_no_write=duplicate_skipped, duplicate_skipped=duplicate_skipped, skipped_no_write=duplicate_skipped, newly_added=not duplicate_skipped and (not updated_existing), result_label='기존 기록 업데이트 · 포맷 정리' if updated_existing and (duplicate_reason == 'format_only_update' or result_message == 'updated_existing_format_only') else '기존 기록 업데이트' if updated_existing else '유사 기록 확인 필요' if duplicate_reason == 'unsafe_similar_record' or result_message == 'similar_record_needs_review' else '이미 저장됨 · 포맷 차이 감지' if normalized_duplicate_skipped else '이미 저장됨' if duplicate_skipped else '신규 저장', response_row=result.get('row', ''), response_col=result.get('col', ''), added_row=added_row, copied_row_template=copied_row_template, style_template_used=style_template_used, style_template_source=style_template_source, max_cell_count=max_cell_count, needs_review=review_candidate, review_reason=review_reason, review_category=review_category, source_index=selected_index, retry_of_run_id=retry_of_run_id, retry_attempt=retry_attempt if retry_run_active else '', retry_source_status=retry_source_status, batch_index=batch_index, batch_size=current_batch_size, batch_total=batch_total, **admin_match_log_fields, summary_text=final_docs_summary))
+                results.append(build_log_csv_to_docs_result_entry(row, status, str(result_message or result.get('status') or '-'), doc_url=doc_url, doc_id=doc_id, dedupe_key=dedupe_key, duplicate_reason=duplicate_reason, dedupe_key_stale=dedupe_key_stale, updated_existing=updated_existing, already_saved_no_write=duplicate_skipped, duplicate_skipped=duplicate_skipped, skipped_no_write=skipped_no_write or duplicate_skipped, newly_added=not skipped_no_write and not duplicate_skipped and (not updated_existing), result_label='문서 확인 필요' if skipped_no_write else '기존 기록 업데이트 · 포맷 정리' if updated_existing and (duplicate_reason == 'format_only_update' or result_message == 'updated_existing_format_only') else '기존 기록 업데이트' if updated_existing else '유사 기록 확인 필요' if duplicate_reason == 'unsafe_similar_record' or result_message == 'similar_record_needs_review' else '이미 저장됨 · 포맷 차이 감지' if normalized_duplicate_skipped else '이미 저장됨' if duplicate_skipped else '신규 저장', response_row=result.get('row', ''), response_col=result.get('col', ''), added_row=added_row, copied_row_template=copied_row_template, style_template_used=style_template_used, style_template_source=style_template_source, max_cell_count=max_cell_count, needs_review=review_candidate, review_reason=review_reason, review_category=review_category, source_index=selected_index, retry_of_run_id=retry_of_run_id, retry_attempt=retry_attempt if retry_run_active else '', retry_source_status=retry_source_status, batch_index=batch_index, batch_size=current_batch_size, batch_total=batch_total, **admin_match_log_fields, summary_text=final_docs_summary))
             except (GoogleDocsPostTimeoutError, GoogleDocsPostIndeterminateError, GoogleDocsLockTimeoutError) as exc:
                 verify_classification = classify_google_docs_timeout_verification(verify_result)
                 verify_status = str(verify_classification.get('status') or 'timeout_unknown')
@@ -5166,6 +5327,20 @@ def render_log_csv_to_docs_preview_ui(
         original_row_hashes = fingerprint_log_csv_rows(original_log_rows)
         history_source_date = log_csv_source_date_from_rows(original_log_rows)
 
+        admin_rows = load_admin_students_from_api(load_admin_api_base_url(), background=True)
+        if st.session_state.get("log_csv_admin_lookup_pending", False):
+            st.caption(f"CSV {len(log_rows):,}행 읽음 · 학생 정보 확인 중")
+            st.dataframe(
+                [{key: row.get(key, "") for key in ("date", "name", "curriculum")} for row in log_rows],
+                use_container_width=True, hide_index=True,
+            )
+            save_button_slot.button(
+                "선택한 기록을 학생 Docs에 추가", disabled=True,
+                key="log_csv_to_docs_save_button",
+            )
+            render_log_csv_admin_lookup_watcher()
+            return
+
         consumed_filter_diagnostic: dict[str, object] = {
             "enabled": admin_consumed_filter_enabled(),
             "removed_count": 0,
@@ -5186,7 +5361,6 @@ def render_log_csv_to_docs_preview_ui(
         )
 
         docs_rows = load_google_docs_map_rows()
-        admin_rows = load_admin_students_from_api(load_admin_api_base_url())
         admin_lookup_error = str(st.session_state.get("last_admin_students_lookup_error") or "")
         matched_rows = match_log_rows_to_docs(log_rows, docs_rows)
         matched_rows = merge_homework_duplicate_log_rows(matched_rows)
@@ -5213,7 +5387,10 @@ def render_log_csv_to_docs_preview_ui(
                 admin_subject_info,
             )
             item["lesson_type_info"] = infer_lesson_type_for_log_item(row, admin_subject_info)
-            docs_preview_text = prepare_log_csv_preview_for_google_docs(item).strip()
+        for item, prepared_text in zip(matched_rows, prepare_log_csv_previews_for_google_docs(
+            matched_rows, consumed_filter_enabled=admin_consumed_filter_enabled(),
+        ), strict=True):
+            docs_preview_text = prepared_text.strip()
             item["docs_preview_text"] = docs_preview_text
             item["docs_progress_diagnostic"] = google_docs_summary_progress_diagnostic(item, docs_preview_text)
             if not docs_preview_text:
@@ -5331,18 +5508,7 @@ def render_log_csv_to_docs_preview_ui(
         ]
         if not history_processing_blocked:
             refresh_log_csv_processing_history_summary(history_summary_placeholder, processing_history)
-        upload_content_signature = hashlib.sha256(
-            json.dumps(log_rows, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest()[:16]
-        upload_signature = "|".join(
-            [
-                str(getattr(uploaded_log_csv, "name", "")),
-                str(getattr(uploaded_log_csv, "size", "")),
-                str(len(log_rows)),
-                upload_content_signature,
-            ]
-        )
-        upload_signature_hash = hashlib.sha256(upload_signature.encode("utf-8")).hexdigest()[:12]
+        upload_signature_hash = log_csv_workspace_signature(uploaded_log_csv, log_rows, matched_rows)
         auto_export_token = ""
         if manually_uploaded_log_csv is None and auto_imported_log_csv is not None:
             auto_export_token = log_csv_auto_export_token(
@@ -5376,14 +5542,14 @@ def render_log_csv_to_docs_preview_ui(
         elif history_completed or history_processing_blocked:
             st.session_state[selection_state_key] = []
         loaded_batch_state = load_current_log_csv_batch_state()
-        legacy_source_batch_state = (
-            loaded_batch_state
-            if log_csv_legacy_batch_source_matches(loaded_batch_state, uploaded_log_csv)
-            else None
-        )
         persisted_batch_state = loaded_batch_state
         if not log_csv_batch_state_matches(persisted_batch_state, upload_signature_hash):
             persisted_batch_state = None
+        stale_scope_for_same_upload = bool(
+            loaded_batch_state is not None and persisted_batch_state is None
+            and loaded_batch_state.get("source_csv_name") == getattr(uploaded_log_csv, "name", "")
+            and loaded_batch_state.get("source_csv_size") == getattr(uploaded_log_csv, "size", 0)
+        )
         persisted_results: list[dict[str, object]] = []
         if persisted_batch_state is not None:
             persisted_results = list(persisted_batch_state.get("results") or [])
@@ -5400,7 +5566,7 @@ def render_log_csv_to_docs_preview_ui(
             if persisted_run_id:
                 st.session_state["log_csv_to_docs_result_run_id"] = persisted_run_id
         completion_confirmation_pending = log_csv_completion_is_pending(persisted_batch_state)
-        history_seed_batch_state = persisted_batch_state or legacy_source_batch_state
+        history_seed_batch_state = persisted_batch_state
         if history_seed_batch_state is not None:
             history_seed_results = list(history_seed_batch_state.get("results") or [])
             history_seed_selected_indices = [
@@ -5424,6 +5590,7 @@ def render_log_csv_to_docs_preview_ui(
             )
             if (
                 not history_processing_blocked and persisted_batch_state is not None
+                and str(persisted_batch_state.get("updated_at") or "") >= history_entry["updated_at"]
                 and not csv_worker_is_running(LOG_CSV_WORKER_LOCK_PATH)
                 and history_seed_results
                 and history_seed_result_indices.issubset(set(range(len(matched_rows))))
@@ -5510,30 +5677,69 @@ def render_log_csv_to_docs_preview_ui(
             or persisted_run_recently_active
         )
         if log_csv_history_processing_is_finished(history_entry) and not history_processing_blocked:
+            original_recheck_items = {
+                tuple(log_csv_history_source_indices(original_item)): original_item
+                for original_item in merge_homework_duplicate_log_rows(
+                    match_log_rows_to_docs(original_log_rows, docs_rows)
+                )
+            }
+
             def verify_completed_csv_record(index: int) -> LogCsvStorageCheck:
                 item = matched_rows[index]
                 row = item["source_row"]
                 matches = item.get("docs_matches") or []
                 if len(matches) != 1:
                     return LogCsvStorageCheck(index, "review", "학생 문서 대상을 다시 확인해야 합니다.")
-                try:
-                    response = verify_summary_in_google_doc_after_timeout(
-                        load_google_apps_script_webapp_url(), str(row.get("name") or ""),
-                        parse_log_export_date(str(row.get("date") or "")),
-                        str(item.get("docs_preview_text") or ""),
-                        str(matches[0].get("doc_id") or ""), build_log_csv_dedupe_key(row),
-                        subject=str((item.get("applied_subject_info") or {}).get("applied_subject") or row.get("curriculum") or ""),
-                        book=google_docs_book_from_log_item(item),
+                summaries = [str(item.get("docs_preview_text") or "")]
+                original_item = original_recheck_items.get(tuple(log_csv_history_source_indices(item)))
+                if original_item is not None:
+                    original_item = dict(original_item)
+                    original_item["applied_subject_info"] = item.get("applied_subject_info") or {}
+                    original_row = original_item["source_row"]
+                    original_matches = original_item.get("docs_matches") or []
+                    if (len(original_matches) != 1
+                            or original_matches[0].get("doc_id") != matches[0].get("doc_id")
+                            or any(original_row.get(key) != row.get(key) for key in ("name", "date"))):
+                        return LogCsvStorageCheck(index, "review", "원본 CSV의 학생 문서 대상을 다시 확인해야 합니다.")
+                    # Consumed notes are excluded from new writes, not from proof of an earlier write.
+                    original_summary = prepare_log_csv_preview_for_google_docs(
+                        original_item, consumed_filter_enabled=False,
+                    ).strip()
+                    if original_summary:
+                        summaries.insert(0, original_summary)
+                elif row.get("_consumed_admin_notes_removed_count") or item.get("admin_consumed_docs_removed_count"):
+                    return LogCsvStorageCheck(index, "review", "원본 CSV의 저장 본문을 다시 확인해야 합니다.")
+
+                def verify_candidate(summary: str) -> LogCsvStorageResponse:
+                    try:
+                        response = verify_summary_in_google_doc_after_timeout(
+                            load_google_apps_script_webapp_url(), str(row.get("name") or ""),
+                            parse_log_export_date(str(row.get("date") or "")), summary,
+                            str(matches[0].get("doc_id") or ""), build_log_csv_dedupe_key(row),
+                            subject=str((item.get("applied_subject_info") or {}).get("applied_subject") or row.get("curriculum") or ""),
+                            book=google_docs_book_from_log_item(item),
+                            preserve_existing_sections=True,
+                        )
+                    except (ValueError, WorkflowStepError):
+                        return LogCsvStorageResponse(False, True, None)
+                    found = response.get("found_existing")
+                    return LogCsvStorageResponse(
+                        ok=response.get("ok") is True, verify_only=response.get("verify_only") is True,
+                        found_existing=found if isinstance(found, bool) else None,
                     )
-                except (ValueError, WorkflowStepError):
-                    return LogCsvStorageCheck(index, "review", "저장 확인 요청을 구성하지 못했습니다.")
-                found = response.get("found_existing")
-                return classify_log_csv_storage_check(index, LogCsvStorageResponse(
-                    ok=response.get("ok") is True, verify_only=response.get("verify_only") is True,
-                    found_existing=found if isinstance(found, bool) else None,
-                ))
+
+                return verify_log_csv_storage_candidates(index, tuple(summaries), verify_candidate)
 
             def persist_completed_csv_recheck(checks: list[LogCsvStorageCheck]) -> bool:
+                applicable_checks = [check for check in checks if check.outcome != "review" or not all(
+                    history_entry["outcomes"][index] in {"success", "duplicate"}
+                    for index in log_csv_history_source_indices(matched_rows[check.source_index])
+                )]
+                unconfirmed_count = sum(check.outcome == "review" for check in checks)
+                if not applicable_checks:
+                    st.session_state["log_csv_recheck_notice"] = (upload_signature_hash, unconfirmed_count)
+                    return True
+                checks = applicable_checks
                 updated_at = log_csv_batch_now_iso()
                 rechecked_entry = history_entry
                 rechecked_state = create_log_csv_batch_state(
@@ -5556,7 +5762,7 @@ def render_log_csv_to_docs_preview_ui(
                         doc_id=str(match.get("doc_id") or ""), doc_url=str(match.get("doc_url") or ""),
                         duplicate_skipped=confirmed, newly_added=False,
                         needs_review=check.outcome == "review", timeout_unknown=check.outcome == "review",
-                        summary_text=str(item.get("docs_preview_text") or ""),
+                        summary_text=check.verified_summary or str(item.get("docs_preview_text") or ""),
                     )
                     rechecked_state = record_log_csv_batch_result(
                         rechecked_state, source_index=check.source_index, result=result,
@@ -5575,6 +5781,8 @@ def render_log_csv_to_docs_preview_ui(
                         latest_entry = find_log_csv_history_entry(latest_history, history_entry["csv_hash"])
                         if latest_entry is not None and latest_entry != history_entry:
                             return False
+                        if load_current_log_csv_batch_state() != loaded_batch_state:
+                            return False
                         save_log_csv_batch_state(LOG_CSV_DOCS_STATE_PATH, rechecked_state)
                         save_log_csv_processing_history(
                             LOG_CSV_PROCESSING_HISTORY_PATH,
@@ -5582,18 +5790,21 @@ def render_log_csv_to_docs_preview_ui(
                         )
                 except (OSError, CsvRunBusyError, LogCsvProcessingHistoryError):
                     return False
+                st.session_state["log_csv_recheck_notice"] = (upload_signature_hash, unconfirmed_count)
                 return True
 
-            recheck_indices = tuple(
-                index for index, item in enumerate(matched_rows)
-                if any(history_entry["outcomes"][source_index] in {"success", "duplicate", "failure", "review"}
-                       for source_index in log_csv_history_source_indices(item))
-            )
+            recheck_indices = log_csv_recheck_indices(history_entry, tuple(
+                tuple(log_csv_history_source_indices(item)) for item in matched_rows
+            ))
+            notice_signature, unconfirmed_count = st.session_state.get("log_csv_recheck_notice", ("", 0))
+            if notice_signature == upload_signature_hash and unconfirmed_count:
+                st.warning(f"재확인 응답 없음 {unconfirmed_count:,}건 · 이전에 확인된 저장 기록은 유지했습니다.")
             render_completed_log_csv_recheck(history_entry, LogCsvRecheckActions(
                 indices=recheck_indices,
                 enabled=not is_saving_docs and bool(load_google_apps_script_webapp_url()),
                 verify=verify_completed_csv_record, persist=persist_completed_csv_recheck,
                 rerun=rerun_log_csv_workspace,
+                document_key=lambda index: str((matched_rows[index].get("docs_matches") or [{}])[0].get("doc_id") or index),
             ))
         if (
             history_completed
@@ -5736,7 +5947,7 @@ def render_log_csv_to_docs_preview_ui(
 
         duplicate_diagnostic_rows = build_log_csv_duplicate_diagnostic_rows(matched_rows, selected_indices)
         if save_excluded_count and not history_completed and not history_processing_blocked:
-            st.info(
+            st.warning(
                 f"현재 선택된 {selected_count:,}건만 Google Docs에 저장됩니다. "
                 f"저장 제외 {save_excluded_count:,}건은 전송되지 않습니다."
             )
@@ -5998,6 +6209,10 @@ def render_log_csv_to_docs_preview_ui(
             retry_source_status_by_index = (
                 dict(st.session_state.get(retry_source_status_key) or {}) if retry_run_active else {}
             )
+            for index in selected_indices:
+                prior_outcomes = {history_entry["outcomes"][source] for source in log_csv_history_source_indices(matched_rows[index])}
+                if stale_scope_for_same_upload or prior_outcomes.intersection({"failure", "review"}):
+                    retry_source_status_by_index.setdefault(str(index), "history_unconfirmed")
             retry_of_run_id = str(st.session_state.get(retry_of_run_id_key) or "") if retry_run_active else ""
             retry_attempt = int(st.session_state.get(retry_attempt_key) or 0)
             if retry_run_active:
@@ -6590,6 +6805,37 @@ def auto_select_admin_sid_candidate(
     return _auto_select_admin_sid_candidate(candidates, context_text)
 
 
+def resolve_admin_notes_candidate(
+    candidates: list[dict[str, str]], student_name: str, export_text: str,
+    counseling_date_value: date, admin_base_url: str,
+) -> tuple[dict[str, str] | None, str]:
+    candidate, reason = auto_select_admin_sid_candidate(
+        candidates, build_admin_sid_auto_match_context(export_text, counseling_date_value),
+    )
+    if candidate is not None or len(candidates) < 2 or not export_text.strip():
+        return candidate, reason
+    saved_candidates = []
+    for current in candidates:
+        sid = str(current.get("admin_sid") or "").strip()
+        if not sid:
+            return None, "저장 대상 식별 정보 없음"
+        request = AdminNotesSyncRequest(
+            student_name=student_name, counseling_date=counseling_date_value,
+            admin_sid=sid, admin_base_url=admin_base_url, export_text=export_text,
+            export_source_label="정리본", today_focus_text="", preview_key="target-read-only",
+        )
+        try:
+            entry = get_admin_log_entry(admin_base_url, counseling_date_value, sid)
+        except WorkflowStepError:
+            return None, "저장 기록 조회 실패"
+        notes = str(entry.get("notes") or "")
+        if notes and resolved_admin_notes_for_sync(request, notes) == notes:
+            saved_candidates.append(current)
+    if len(saved_candidates) == 1:
+        return saved_candidates[0], "기존 저장 내용 일치"
+    return None, ""
+
+
 @st.cache_data(show_spinner=False, ttl=300)
 def load_admin_students_from_api_cached(base_url: str) -> list[dict[str, str]]:
     clean_base_url = (base_url or DEFAULT_ADMIN_API_BASE_URL).strip().rstrip("/")
@@ -6622,8 +6868,24 @@ def load_admin_students_from_api_cached(base_url: str) -> list[dict[str, str]]:
     return students
 
 
-def load_admin_students_from_api(base_url: str) -> list[dict[str, str]]:
-    rows = load_admin_students_from_api_cached(base_url)
+def load_admin_students_from_api(base_url: str, *, background: bool = False) -> list[dict[str, str]]:
+    if background:
+        lookup = st.session_state.get("log_csv_admin_lookup")
+        if lookup is None or lookup.base_url != base_url or (
+            lookup.future.done() and time.monotonic() - lookup.started_at >= 300
+        ):
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="connect-log-csv-admin")
+            future = executor.submit(load_admin_students_from_api_cached, base_url)
+            executor.shutdown(wait=False)
+            lookup = AdminStudentsLookup(base_url, time.monotonic(), future)
+            st.session_state["log_csv_admin_lookup"] = lookup
+        pending = not lookup.future.done()
+        st.session_state["log_csv_admin_lookup_pending"] = pending
+        if pending:
+            return []
+        rows = lookup.future.result()
+    else:
+        rows = load_admin_students_from_api_cached(base_url)
     if rows and rows[0].get("_error"):
         st.session_state["last_admin_students_lookup_error"] = rows[0]["_error"]
         return []
@@ -6897,6 +7159,11 @@ def resolved_admin_notes_for_sync(
     request: AdminNotesSyncRequest,
     existing_notes: str,
 ) -> str:
+    if request.preserve_existing_notes:
+        try:
+            return merge_admin_summary(existing_notes, request.export_text, request.previous_export_text)
+        except AdminSummaryMergeConflict as exc:
+            raise WorkflowStepError("admin 특이사항 저장", str(exc)) from exc
     if request.export_source_label == "오늘 확인할 것" and request.today_focus_text:
         return merge_today_focus_block(existing_notes, request.today_focus_text)
     return request.export_text
@@ -6974,6 +7241,12 @@ def sync_admin_notes(request: AdminNotesSyncRequest) -> AdminNotesSyncResult:
         new_notes,
         base_notes,
     )
+    if request.preserve_existing_notes:
+        confirmed = get_admin_log_entry(request.admin_base_url, request.counseling_date, request.admin_sid)
+        confirmed_notes = str(confirmed.get("notes") or "")
+        if (normalized_admin_notes(new_notes) not in normalized_admin_notes(confirmed_notes)
+                or normalized_admin_notes(confirmed_notes).count(normalized_admin_notes(request.export_text)) != 1):
+            raise WorkflowStepError("admin 특이사항 저장", "저장 요청 뒤 실제 내용을 확인하지 못했습니다. 재시도 시 기존 내용부터 확인합니다.")
     return AdminNotesSyncResult(
         updated=True,
         notes=new_notes,
@@ -7039,6 +7312,7 @@ def render_admin_notes_save_ui(
     today_focus_text: str = "",
     summary_text: str = "",
     export_allowed: bool = True,
+    auto_save: bool = False,
 ) -> AdminNotesSyncRequest | None:
     ui_locked = st.session_state.get("is_processing", False)
     clean_student_name = (student_name or "").strip()
@@ -7103,9 +7377,9 @@ def render_admin_notes_save_ui(
                 sid_candidates,
                 override.get("selected_admin_sid", ""),
             )
-        auto_candidate, auto_match_reason = auto_select_admin_sid_candidate(
-            sid_candidates,
-            build_admin_sid_auto_match_context(clean_export_text, counseling_date_value),
+        auto_candidate, auto_match_reason = resolve_admin_notes_candidate(
+            sid_candidates, clean_student_name, clean_export_text,
+            counseling_date_value, admin_base_url,
         )
         current_auto_label = format_admin_sid_candidate_label(auto_candidate) if auto_candidate else ""
         stored_label_is_auto_default = bool(stored_label and stored_label == stored_auto_default_label)
@@ -7150,13 +7424,16 @@ def render_admin_notes_save_ui(
                 st.session_state.pop("selected_admin_sid_for_student", None)
                 st.session_state.pop("selected_admin_sid_for_student_source", None)
                 st.rerun()
-        selected_label = st.selectbox(
-            "저장 대상 admin SID",
-            options=select_options,
-            index=select_options.index(default_label),
-            key=select_key,
-            disabled=ui_locked,
-        )
+        if default_candidate and not force_target_change:
+            selected_label = default_label
+        else:
+            selected_label = st.selectbox(
+                "저장 대상 admin SID",
+                options=select_options,
+                index=select_options.index(default_label),
+                key=select_key,
+                disabled=ui_locked,
+            )
         label_candidate, label_candidate_selected = resolve_admin_sid_manual_candidate(
             sid_candidates,
             selected_label,
@@ -7212,7 +7489,7 @@ def render_admin_notes_save_ui(
         public_target_label = " · ".join(public_target_parts) or selected_candidate_label
         st.info(f"저장 대상: {public_target_label}")
         if multiple_candidates and target_resolution == "auto_roster_match":
-            st.info(f"후보 명단 대조로 자동 선택했습니다. ({auto_match_reason})")
+            st.caption(f"저장 대상 자동 확인 · {auto_match_reason}")
     elif multiple_candidates:
         st.info("동명이인/복수 후보가 있습니다. 저장 대상을 직접 선택하세요.")
     if st.session_state.get("show_developer_diagnostics", False):
@@ -7229,11 +7506,23 @@ def render_admin_notes_save_ui(
                 target_lines.append(f"- 선택한 행: {format_admin_sid_candidate_label(selected_candidate)}")
             target_lines.append(f"- 대상 확정 방식: {target_resolution or '미확정'}")
             st.write("\n".join(target_lines))
-    save_clicked = False if already_saved else st.button("5A ADMIN 특이사항으로 내보내기", disabled=ui_locked)
+    auto_attempted = bool(preview_key and st.session_state.get("admin_notes_auto_attempt_key") == preview_key)
+    automatic_save = bool(
+        auto_save and pending_admin_sync is not None and not ui_locked
+        and not already_saved and not auto_attempted
+    )
+    save_clicked = False
+    if not already_saved and (not auto_save or auto_attempted):
+        save_clicked = st.button(
+            "ADMIN 저장 다시 시도" if auto_save else "5A ADMIN 특이사항으로 내보내기",
+            disabled=ui_locked,
+        )
     admin_save_result = st.empty()
     if already_saved:
-        admin_save_result.caption("이미 이 정리본을 5A ADMIN 특이사항에 저장했습니다.")
-    if save_clicked:
+        admin_save_result.success("ADMIN 저장 완료")
+    if save_clicked or automatic_save:
+        if automatic_save:
+            st.session_state["admin_notes_auto_attempt_key"] = preview_key
         block_message = admin_notes_export_block_message(
             student_name=clean_student_name,
             export_text=clean_export_text,
@@ -7248,11 +7537,12 @@ def render_admin_notes_save_ui(
             if pending_admin_sync is None:
                 admin_save_result.warning("저장할 admin 대상과 정리본을 먼저 확인하세요.")
                 return None
+            admin_save_result.info("ADMIN 저장 중")
             sync_result = sync_admin_notes(pending_admin_sync)
             backup_path = sync_result.backup_path
             if not sync_result.updated:
                 st.session_state["last_admin_notes_save_key"] = preview_key
-                admin_save_result.warning("이미 같은 정리본이 5A ADMIN 특이사항에 있어 추가 저장하지 않았습니다.")
+                admin_save_result.success("ADMIN 저장 완료 · 중복 추가 없음")
                 return pending_admin_sync
             st.session_state["admin_notes_save_success"] = "정리본을 5A ADMIN 특이사항에 저장했습니다."
             st.session_state["last_admin_notes_save_key"] = preview_key
@@ -7294,7 +7584,19 @@ def build_whisper_initial_prompt(student_name: str, use_prompt_hint: bool) -> st
     if clean_name:
         return f"한국어 학원 상담 녹음입니다. 학생명은 {clean_name}입니다."
     return WHISPER_INITIAL_PROMPT
+DEFAULT_SUMMARY_STYLE = "자세하게"
 SUMMARY_STYLES = {
+    DEFAULT_SUMMARY_STYLE: (
+        "원문에 근거한 구체 상담 내용을 빠뜨리지 않도록 자세하게 정리한다. "
+        "짧은 핵심 요약으로 축약하거나 bullet 수를 임의로 제한하지 않는다. "
+        "서로 다른 사실은 구분하고, 교재·단원·범위·문항·성적·일정·과제 상태, "
+        "학생이 말한 어려움과 사유, 교사의 설명·지도 방향, 합의한 후속 조치와 기한을 "
+        "발화에 나온 만큼 보존한다. 한 주제의 경과·이유·대응은 맥락이 드러나게 연결한다. "
+        "필요하면 한 bullet에 두세 문장으로 적어도 된다. 구체 확인 대상은 [오늘 확인할 것]에, "
+        "학습 방향은 [학생별 학습흐름]에, 나머지 상담 경과와 배경은 *상담 참고사항*에 담는다. "
+        "상세함을 위해 같은 사실을 반복하거나 없는 교재명·범위·감정·계획을 만들지 않는다. "
+        "짧은 녹음은 확인된 사실의 양에 맞게 적고, 수학 문제 풀이의 반복 발화는 같은 지도 내용으로 묶는다."
+    ),
     "기본 상담 정리": "상담 내용을 균형 있게 정리한다.",
     "내부 기록용": "강사와 학원 내부자가 후속 조치를 확인하기 좋게 객관적으로 정리한다.",
     "다음 상담 체크용": "다음 상담에서 확인할 질문과 체크 포인트 중심으로 정리한다.",
@@ -7307,6 +7609,7 @@ PROGRESS_STAGES = [
     "원문 저장",
     "정리본 생성",
     "클립보드 복사",
+    "ADMIN 저장",
 ]
 
 
@@ -8295,7 +8598,7 @@ def prepare_codex_summary_processing() -> bool:
 def render_codex_login_recovery(ui_locked: bool) -> None:
     if not st.session_state.get("codex_login_required"):
         return
-    st.info("Codex에 다시 로그인한 뒤 정리본 생성·복사를 누르면 저장된 작업부터 이어집니다.")
+    st.info("Codex에 다시 로그인한 뒤 정리하고 ADMIN 저장을 누르면 저장된 작업부터 이어집니다.")
     if not st.button("Codex 로그인 열기", disabled=ui_locked, key="open_codex_login"):
         return
     executable = _find_codex_executable()
@@ -8311,7 +8614,7 @@ def render_codex_login_recovery(ui_locked: bool) -> None:
     except OSError as exc:
         st.error(f"Codex 로그인 창을 열지 못했습니다: {exc}")
         return
-    st.success("열린 창에서 로그인을 완료한 뒤 정리본 생성·복사를 다시 누르세요.")
+    st.success("열린 창에서 로그인을 완료한 뒤 정리하고 ADMIN 저장을 다시 누르세요.")
 
 
 def run_codex_summary(prompt: str) -> str:
@@ -8899,7 +9202,7 @@ def audio_batch_job_snapshot(job: AudioBatchJob, position: int, total: int) -> d
         "batch_total": total,
         "resume_summary_only": bool(transcript_path and Path(transcript_path).is_file()),
         "resume_transcript_path": transcript_path,
-        "resume_admin_save_only": bool(job["summary"].strip()),
+        "resume_admin_save_only": summary_copy_save_allowed(job["summary"], SUMMARY_STATUS_READY),
     }
 
 
@@ -9000,11 +9303,11 @@ def checkpoint_active_audio_batch_transcript(transcript_path: Path) -> None:
 
 
 def audio_batch_all_saved(state: AudioBatchState) -> bool:
-    return all(job["status"] == "completed" and job.get("admin_saved", False) for job in state["jobs"])
+    return audio_workflow_counts(state).complete
 
 
 def audio_batch_saved_student_count(state: AudioBatchState) -> int:
-    return len({job["admin_sid"] for job in state["jobs"] if job.get("admin_saved") and job.get("admin_sid")})
+    return audio_workflow_counts(state).students
 
 
 def save_audio_batch_job_to_admin(job_id: str) -> None:
@@ -9023,8 +9326,8 @@ def save_audio_batch_job_to_admin(job_id: str) -> None:
         override = get_local_admin_sid_override(job["student_name"])
         candidate = find_admin_sid_candidate_by_sid(candidates, override.get("selected_admin_sid", ""))
     if candidate is None:
-        candidate, _ = auto_select_admin_sid_candidate(
-            candidates, build_admin_sid_auto_match_context(export_text, counseling_date),
+        candidate, _ = resolve_admin_notes_candidate(
+            candidates, job["student_name"], export_text, counseling_date, base_url,
         )
     admin_sid = (candidate or {}).get("admin_sid", "")
     block_message = admin_notes_export_block_message(
@@ -9045,6 +9348,7 @@ def save_audio_batch_job_to_admin(job_id: str) -> None:
         student_name=job["student_name"], counseling_date=counseling_date, admin_sid=admin_sid,
         admin_base_url=base_url, export_text=export_text, export_source_label=source_label,
         today_focus_text="", preview_key=admin_notes_preview_key(job["student_name"], counseling_date, admin_sid, export_text),
+        preserve_existing_notes=True, previous_export_text=job.get("admin_saved_export", ""),
     )
     try:
         result = sync_admin_notes(request)
@@ -9057,8 +9361,10 @@ def save_audio_batch_job_to_admin(job_id: str) -> None:
         transcript_path=job["transcript_path"], summary=job["summary"], updated_at=audio_batch_now_iso(),
     )
     next(item for item in saved["jobs"] if item["job_id"] == job_id)["admin_saved"] = True
+    next(item for item in saved["jobs"] if item["job_id"] == job_id)["admin_saved_export"] = export_text
     persist_audio_batch_session_state(saved)
     st.session_state["last_admin_notes_save_key"] = request.preview_key
+    request_recording_cleanup(BASE_DIR, next(item for item in saved["jobs"] if item["job_id"] == job_id))
 
 
 def save_completed_audio_batch_summaries() -> None:
@@ -9075,6 +9381,8 @@ def finish_active_audio_batch_job(
     transcript_path: str,
     summary: str,
     pause_batch: bool,
+    auto_save_to_admin: bool = False,
+    refresh_status: Callable[[], None] | None = None,
 ) -> None:
     snapshot = st.session_state.get("current_job_snapshot") or {}
     job_id = str(snapshot.get("batch_job_id") or "")
@@ -9098,9 +9406,18 @@ def finish_active_audio_batch_job(
     if summary.strip() and status in {"completed", "needs_review"}:
         completed_job = next(job for job in updated["jobs"] if job["job_id"] == job_id)
         st.session_state["pending_student_name_from_file"] = completed_job["student_name"]
+    if auto_save_to_admin and status == "completed" and not pause_batch and summary_copy_save_allowed(summary, SUMMARY_STATUS_READY):
+        set_progress("ADMIN 저장", "진행 중", "저장 후 실제 내용 확인")
+        if refresh_status:
+            refresh_status()
+        save_audio_batch_job_to_admin(job_id)
+        saved_job = next(job for job in st.session_state["audio_batch_state"]["jobs"] if job["job_id"] == job_id)
+        set_progress("ADMIN 저장", "완료" if saved_job.get("admin_saved") else "보완 필요", saved_job["detail"])
     st.session_state["is_processing"] = False
     st.session_state["pending_main_run"] = False
     st.session_state["current_job_snapshot"] = None
+    if refresh_status:
+        refresh_status()
     if pause_batch:
         st.session_state["post_run_warning"] = (
             "Codex를 사용할 수 없어 일괄 처리를 멈췄습니다. 로그인 또는 사용량 상태를 확인한 뒤 "
@@ -9179,9 +9496,11 @@ def save_draft(last_step: str | None = None) -> None:
             "author_name": st.session_state.get("author_name", get_default_author_name()),
             "counseling_date": counseling_date_value,
             "selected_mode": st.session_state.get("selected_mode", "균형 모드"),
-            "selected_summary_style": st.session_state.get("selected_summary_style", "기본 상담 정리"),
+            "selected_summary_style": st.session_state.get("selected_summary_style", DEFAULT_SUMMARY_STYLE),
             "transcript_text": st.session_state.get("transcript_text", ""),
             "transcript_file_path": st.session_state.get("current_transcript_path", ""),
+            "latest_summary": st.session_state.get("latest_summary", ""),
+            "summary_status": st.session_state.get("summary_status", ""),
             "uploaded_audio_saved_path": st.session_state.get("uploaded_audio_saved_path", ""),
             "current_audio_path": st.session_state.get("current_audio_path", ""),
             "last_step": last_step or st.session_state.get("last_step", ""),
@@ -9217,12 +9536,12 @@ def initialize_draft_state() -> None:
         st.session_state["draft_restored_counseling_date"] = restored_date.isoformat()
 
         selected_mode = draft.get("selected_mode", "균형 모드")
-        selected_style = draft.get("selected_summary_style", "기본 상담 정리")
+        selected_style = draft.get("selected_summary_style", DEFAULT_SUMMARY_STYLE)
         st.session_state["selected_mode"] = (
             selected_mode if selected_mode in PROCESSING_MODES else "균형 모드"
         )
         st.session_state["selected_summary_style"] = (
-            selected_style if selected_style in SUMMARY_STYLES else "기본 상담 정리"
+            selected_style if selected_style in SUMMARY_STYLES else DEFAULT_SUMMARY_STYLE
         )
         st.session_state["transcript_text"] = draft.get("transcript_text", "")
         st.session_state["current_transcript_path"] = draft.get("transcript_file_path", "")
@@ -9232,10 +9551,17 @@ def initialize_draft_state() -> None:
             draft.get("uploaded_audio_saved_path", ""),
         )
         st.session_state["last_step"] = draft.get("last_step", "")
+        restored_summary = str(draft.get("latest_summary") or "")
+        restored_summary_status = str(draft.get("summary_status") or "")
+        if restored_date == today_kst and summary_copy_save_allowed(restored_summary, restored_summary_status):
+            st.session_state["latest_summary"] = restored_summary
+            st.session_state["summary_status"] = restored_summary_status
+            st.session_state["summary_generation_failed"] = False
         if st.session_state["student_name"]:
             st.session_state["form_transcript_key"] = (
                 f"{st.session_state['counseling_date'].isoformat()}|"
-                f"{sanitize_filename_part(st.session_state['student_name'])}"
+                f"{sanitize_filename_part(st.session_state['student_name'])}|"
+                f"{sanitize_filename_part(st.session_state['author_name'])}"
             )
     else:
         st.session_state.setdefault("student_name", "")
@@ -9243,7 +9569,7 @@ def initialize_draft_state() -> None:
         st.session_state.setdefault("counseling_date", today_kst)
         st.session_state.setdefault("counseling_date_input", st.session_state["counseling_date"])
         st.session_state.setdefault("selected_mode", "GPU 터보 모드")
-        st.session_state.setdefault("selected_summary_style", "기본 상담 정리")
+        st.session_state.setdefault("selected_summary_style", DEFAULT_SUMMARY_STYLE)
         st.session_state.setdefault("transcript_text", "")
         st.session_state.setdefault("transcript_segments", [])
         st.session_state.setdefault("segment_rows", [])
@@ -9384,20 +9710,28 @@ def workflow_step_failure_progress_detail(stage: str, error: object) -> str:
 
 
 def render_progress(container) -> None:
-    icons = {"대기": "-", "진행 중": "…", "완료": "✓", "보완 필요": "!", "실패": "!"}
     with container:
         st.subheader("처리 상태")
-        progress = st.session_state.get("progress", {stage: "대기" for stage in PROGRESS_STAGES})
-        detail = st.session_state.get("progress_detail", {})
-        if all(progress.get(stage, "대기") == "대기" for stage in PROGRESS_STAGES):
-            st.write("- 대기 중")
+        batch = st.session_state.get("audio_batch_state")
+        if batch:
+            counts = audio_workflow_counts(batch)
+            st.metric("정리 완료", f"{counts.generated_students} / {counts.total_students}명")
+            st.metric("ADMIN 저장 완료", f"{counts.students} / {counts.total_students}명")
+        if batch and not st.session_state.get("is_processing"):
+            counts = audio_workflow_counts(batch)
+            st.caption("ADMIN 저장 확인 완료" if counts.complete else f"확인 필요 {counts.review + counts.failed}건" if counts.review or counts.failed else "이어서 처리 대기")
             return
-        for stage in PROGRESS_STAGES:
-            state = progress.get(stage, "대기")
-            if state == "대기":
-                continue
-            suffix = f" · {detail[stage]}" if detail.get(stage) else ""
-            st.write(f"{icons.get(state, '-')} {stage}: {state}{suffix}")
+        progress = st.session_state.get("progress", {stage: "대기" for stage in PROGRESS_STAGES})
+        if all(progress.get(stage, "대기") == "대기" for stage in PROGRESS_STAGES):
+            st.caption("대기 중")
+            return
+        active = next((stage for stage in PROGRESS_STAGES if progress.get(stage) == "진행 중"), None)
+        stage = active or next((stage for stage in reversed(PROGRESS_STAGES) if progress.get(stage, "대기") != "대기"), PROGRESS_STAGES[0])
+        st.markdown(f"**{stage}**")
+        st.caption(progress[stage])
+        snapshot = st.session_state.get("current_job_snapshot") or {}
+        if snapshot.get("batch_job_id"):
+            st.caption(f"{snapshot['batch_position']}/{snapshot['batch_total']} · {snapshot['student_name']}")
 
 
 def set_troubleshooting_info(
@@ -9459,33 +9793,76 @@ def audio_batch_status_label(status: str) -> str:
 
 
 def audio_batch_panel_expanded(state: AudioBatchState | None) -> bool:
-    return bool(
-        state and state["status"] == "running"
-        and any(job["status"] in {"pending", "processing"} for job in state["jobs"])
-    )
+    return False
 
 
 def render_audio_batch_admin_target(selected_job: AudioBatchJob) -> None:
     if selected_job.get("admin_saved"):
         return
+    job_id = selected_job["job_id"]
+
+    def select_target() -> None:
+        state = st.session_state["audio_batch_state"]
+        selected_sid = st.session_state[f"audio_batch_admin_sid_{job_id}"]
+        persist_audio_batch_session_state({**state, "jobs": [
+            {**job, "admin_sid": selected_sid, "admin_saved_export": ""} if job["job_id"] == job_id else job
+            for job in state["jobs"]
+        ]})
+        if selected_sid:
+            save_audio_batch_job_to_admin(job_id)
+
     candidates = find_admin_sid_candidates_for_student(selected_job["student_name"], load_admin_api_base_url())
+    if not candidates:
+        st.warning("ADMIN 명단에서 일치하는 학생을 찾지 못했습니다.")
+
+        def correct_name() -> None:
+            name = st.session_state[f"audio_batch_name_{job_id}"].strip()
+            if not name:
+                return
+            state = st.session_state["audio_batch_state"]
+            persist_audio_batch_session_state({**state, "jobs": [
+                {**job, "student_name": name, "admin_sid": "", "admin_saved_export": ""} if job["job_id"] == job_id else job
+                for job in state["jobs"]
+            ]})
+            save_audio_batch_job_to_admin(job_id)
+
+        st.text_input("학생명 수정", value=selected_job["student_name"], key=f"audio_batch_name_{job_id}",
+                      disabled=st.session_state.get("is_processing", False), on_change=correct_name)
     if len(candidates) > 1:
         sid_options = ["", *[candidate["admin_sid"] for candidate in candidates]]
-        selected_sid = st.selectbox(
+        st.selectbox(
             "일괄 저장 대상", options=sid_options,
             index=sid_options.index(selected_job.get("admin_sid", "")) if selected_job.get("admin_sid", "") in sid_options else 0,
             format_func=lambda sid: format_admin_sid_candidate_label(next(candidate for candidate in candidates if candidate["admin_sid"] == sid)) if sid else ADMIN_SID_MANUAL_SELECT_PLACEHOLDER,
             key=f"audio_batch_admin_sid_{selected_job['job_id']}", disabled=st.session_state.get("is_processing", False),
+            on_change=select_target,
         )
-        if selected_sid != selected_job.get("admin_sid", ""):
-            state = st.session_state["audio_batch_state"]
-            persist_audio_batch_session_state({**state, "jobs": [
-                {**job, "admin_sid": selected_sid} if job["job_id"] == selected_job["job_id"] else job
-                for job in state["jobs"]
-            ]})
 
 
-def render_audio_batch_state_ui(ui_locked: bool) -> None:
+def render_audio_batch_controls(ui_locked: bool) -> None:
+    state = st.session_state.get("audio_batch_state")
+    if not state:
+        return
+    counts = audio_batch_counts(state)
+    if state["status"] == "paused" and counts["pending"]:
+        resume_button_slot = st.empty()
+        if resume_button_slot.button("남은 작업 이어서 처리", disabled=ui_locked, use_container_width=True):
+            resume_button_slot.info("처리를 시작했습니다.")
+            persist_audio_batch_session_state(resume_audio_batch_state(state, audio_batch_now_iso()))
+            start_next_audio_batch_job_with_refresh()
+    problem_count = sum(job["status"] in {"failed", "needs_review"} or
+        (job["status"] == "completed" and not job.get("admin_saved")) for job in state["jobs"])
+    if problem_count:
+        storage_only = all(summary_copy_save_allowed(job["summary"], SUMMARY_STATUS_READY)
+            for job in state["jobs"] if not job.get("admin_saved"))
+        if st.button(f"{'미저장 정리본 저장' if storage_only else '미완료 항목 다시 처리'} ({problem_count}건)",
+            key="audio_batch_retry", disabled=ui_locked or state["status"] == "running" or counts["pending"] > 0,
+            use_container_width=True):
+            persist_audio_batch_session_state(prepare_audio_batch_retry(state, audio_batch_now_iso()))
+            start_next_audio_batch_job_with_refresh()
+
+
+def render_audio_batch_state_ui(ui_locked: bool, *, show_controls: bool = True) -> None:
     if st.session_state.pop("audio_batch_recovered", False):
         st.info("중단된 일괄 처리 기록을 복구했습니다. 남은 작업 이어서 처리를 누르면 계속됩니다.")
     load_warning = st.session_state.pop("audio_batch_load_warning", "")
@@ -9507,15 +9884,6 @@ def render_audio_batch_state_ui(ui_locked: bool) -> None:
         ui_locked = False
         st.info("멈춘 일괄 처리 기록을 복구했습니다. 남은 작업 이어서 처리를 누르면 계속됩니다.")
     counts = audio_batch_counts(state)
-    saved_records = sum(bool(job.get("admin_saved")) for job in state["jobs"])
-    generated_records = sum(bool(job["summary"].strip()) for job in state["jobs"])
-    save_pending = sum(bool(job["summary"].strip()) and not job.get("admin_saved") for job in state["jobs"])
-    st.progress(saved_records / max(state["total"], 1))
-    st.caption(
-        f"총 {state['total']}개 · 정리본 {generated_records}개 · ADMIN 저장 완료 {audio_batch_saved_student_count(state)}명 · "
-        f"저장 대기 {save_pending}건 · 처리 중 {counts['processing']} · "
-        f"대기 {counts['pending']} · 확인 필요 {counts['needs_review']} · 실패 {counts['failed']}"
-    )
 
     processing_job = next((job for job in state["jobs"] if job["status"] == "processing"), None)
     current_status_text = {
@@ -9535,67 +9903,20 @@ def render_audio_batch_state_ui(ui_locked: bool) -> None:
         )
     st.caption(current_status_text)
 
-    if save_pending and st.button(
-        f"5A ADMIN 일괄 적용 ({save_pending}건)",
-        disabled=ui_locked or counts["pending"] > 0 or counts["processing"] > 0,
-        use_container_width=True,
-    ):
-        st.session_state["is_processing"] = True
-        try:
-            with st.spinner("정리본을 학생별 ADMIN 특이사항에 저장 중입니다."):
-                save_completed_audio_batch_summaries()
-        finally:
-            st.session_state["is_processing"] = False
-        st.rerun()
-    if audio_batch_all_saved(state) and not state.get("acknowledged_at"):
-        if st.button("일괄 저장 완료 확인", disabled=ui_locked, use_container_width=True):
-            persist_audio_batch_session_state({**state, "acknowledged_at": audio_batch_now_iso()})
-            st.session_state["audio_batch_state"] = None
-            st.rerun()
-
-    action_columns = st.columns(2)
-    with action_columns[0]:
-        resume_disabled = ui_locked or state["status"] != "paused" or counts["pending"] == 0
-        resume_button_slot = st.empty()
-        if resume_button_slot.button(
-            "남은 작업 이어서 처리",
-            disabled=resume_disabled,
-            use_container_width=True,
-        ):
-            resume_button_slot.info("처리를 시작했습니다.")
-            resumed = resume_audio_batch_state(state, audio_batch_now_iso())
-            persist_audio_batch_session_state(resumed)
-            start_next_audio_batch_job_with_refresh()
-    with action_columns[1]:
-        problem_count = counts["failed"] + counts["needs_review"]
-        retry_disabled = (
-            ui_locked
-            or problem_count == 0
-            or state["status"] == "running"
-            or counts["pending"] > 0
-        )
-        if st.button(
-            f"문제 파일만 다시 처리 ({problem_count})",
-            disabled=retry_disabled,
-            use_container_width=True,
-        ):
-            retried = prepare_audio_batch_retry(state, audio_batch_now_iso())
-            persist_audio_batch_session_state(retried)
-            start_next_audio_batch_job_with_refresh()
+    if show_controls:
+        render_audio_batch_controls(ui_locked)
 
     result_rows = []
-    for index, job in enumerate(state["jobs"], start=1):
+    for job in state["jobs"]:
         result_rows.append(
             {
-                "순서": index,
                 "학생": job["student_name"],
-                "파일": job["source_name"],
-                "상태": "ADMIN 저장 완료" if job.get("admin_saved") else "정리본 생성 완료 · 저장 대기" if job["status"] == "completed" else audio_batch_status_label(job["status"]),
-                "내용": job["detail"] or "처리 대기 중",
+                "단계": "정리 완료" if job["status"] == "completed" else audio_batch_status_label(job["status"]),
+                "ADMIN": "저장 완료" if job.get("admin_saved") and job.get("admin_sid") else "미저장",
             }
         )
     if result_rows:
-        st.dataframe(result_rows, hide_index=True, use_container_width=True)
+        st.dataframe(result_rows, hide_index=True, use_container_width=True, height=min(320, 36 * len(result_rows) + 40))
 
     render_audio_batch_summary_review(state, ui_locked, AudioBatchReviewActions(
         persist=persist_audio_batch_session_state, render_target=render_audio_batch_admin_target,
@@ -9666,6 +9987,16 @@ def open_folder(path: Path) -> None:
         subprocess.Popen(["open", str(path)], shell=False)
     else:
         subprocess.Popen(["xdg-open", str(path)], shell=False)
+
+
+@st.fragment(run_every="2s")
+def render_recording_backup_status_ui() -> None:
+    warning = recording_backup_warning(BASE_DIR)
+    if warning:
+        st.warning(warning, icon=":material/cloud_off:")
+        if not recording_backup_is_running(BASE_DIR):
+            st.button("백업 다시 시도", icon=":material/refresh:", key="retry_recording_backup",
+                      on_click=retry_recording_backup, args=(BASE_DIR,))
 
 
 def main() -> None:
@@ -9946,9 +10277,7 @@ def main() -> None:
         )
     render_progress(status_placeholder.container())
 
-    with right_col:
-        st.divider()
-        st.subheader("오\u2060늘 정\u2060리\u2060본 생\u2060성\u00a0기\u2060록")
+    with right_col, st.expander("오늘 정리본 생성 기록", expanded=False):
         transcript_folder = transcript_date_dir(counseling_date)
         if show_developer_diagnostics:
             if st.button("정리본 기록 폴더 열기", disabled=ui_locked):
@@ -10009,24 +10338,29 @@ def main() -> None:
         render_progress(status_placeholder.container())
 
     with audio_details_container:
+        render_recording_backup_status_ui()
         batch_state = st.session_state.get("audio_batch_state")
         batch_counts = audio_batch_counts(batch_state) if batch_state else None
         unfinished_batch = bool(
             batch_counts
             and (batch_counts["pending"] > 0 or batch_counts["processing"] > 0)
         )
+        retained_batch = bool(batch_state and not batch_state.get("acknowledged_at"))
         uploaded_files = audio_upload_placeholder.file_uploader(
             f"상담 녹음 파일 업로드 · 최대 {AUDIO_BATCH_MAX_FILES}개",
             label_visibility="collapsed",
             type=sorted(ALLOWED_EXTENSIONS),
             accept_multiple_files=True,
-            disabled=ui_locked or unfinished_batch,
+            disabled=ui_locked or retained_batch,
             key=st.session_state.get("audio_upload_key", "audio_upload"),
             on_change=handle_audio_upload_change,
         )
         upload_mode = classify_audio_upload_selection(len(uploaded_files))
         uploaded_file = uploaded_files[0] if upload_mode == "single" else None
-        if uploaded_file is not None:
+        audio_upload_placeholder.caption(f"업로드 완료 {len(uploaded_files)}개")
+        if ui_locked and not (batch_counts and batch_counts["processing"]):
+            st.info(f"단일 녹음 처리 중 · {st.session_state.get('last_step') or '처리 준비'}")
+        if uploaded_file is not None and not (retained_batch and audio_batch_all_saved(batch_state)):
             try:
                 save_uploaded_file_copy(uploaded_file)
                 save_draft("녹음 파일 업로드")
@@ -10035,9 +10369,22 @@ def main() -> None:
 
         batch_expanded = audio_batch_panel_expanded(batch_state)
         if batch_state:
+            with st.container(key="audio-overview"):
+                render_audio_workflow_overview(batch_state)
+            if audio_batch_all_saved(batch_state) and not batch_state.get("acknowledged_at"):
+                if st.button("일괄 저장 완료 확인", disabled=ui_locked, use_container_width=True):
+                    persist_audio_batch_session_state({**batch_state, "acknowledged_at": audio_batch_now_iso()})
+                    st.session_state["audio_batch_state"] = None
+                    clear_selected_audio_after_success()
+                    st.session_state["latest_summary"] = ""
+                    st.session_state["summary_status"] = ""
+                    st.rerun()
+            render_audio_batch_controls(ui_locked)
+            render_audio_processing_log(batch_state, st.session_state.get("progress"), st.session_state.get("progress_detail"))
             with st.expander("일괄 처리 현황", expanded=batch_expanded):
-                render_audio_batch_state_ui(ui_locked)
+                render_audio_batch_state_ui(ui_locked, show_controls=False)
         else:
+            render_audio_processing_log(None, st.session_state.get("progress"), st.session_state.get("progress_detail"))
             render_audio_batch_state_ui(ui_locked)
 
         if unfinished_batch and not ui_locked:
@@ -10050,9 +10397,8 @@ def main() -> None:
                 f"현재 {len(uploaded_files)}개가 선택되었습니다."
             )
         elif batch_uploaded_files:
-            st.caption("학생명을 확인하세요.")
             batch_student_names: list[str] = []
-            name_columns = st.columns(2)
+            name_inputs: list[tuple[str, str]] = []
             for index, batch_file in enumerate(batch_uploaded_files):
                 detected_name = extract_student_name_from_audio_filename(batch_file.name) or ""
                 signature = hashlib.sha256(
@@ -10060,24 +10406,21 @@ def main() -> None:
                 ).hexdigest()[:16]
                 input_key = f"audio_batch_student_{signature}"
                 st.session_state.setdefault(input_key, detected_name)
-                with name_columns[index % 2]:
-                    st.caption(batch_file.name)
-                    batch_student_names.append(
-                        st.text_input(
-                            "학생명",
-                            key=input_key,
-                            disabled=ui_locked,
-                            label_visibility="collapsed",
-                            placeholder="학생명 입력",
-                        ).strip()
-                    )
+                name_inputs.append((batch_file.name, input_key))
+            with st.expander("학생명 확인·수정", expanded=any(not st.session_state[key].strip() for _, key in name_inputs)):
+                name_columns = st.columns(2)
+                for index, (filename, input_key) in enumerate(name_inputs):
+                    with name_columns[index % 2]:
+                        st.caption(filename)
+                        batch_student_names.append(st.text_input("학생명", key=input_key, disabled=ui_locked,
+                            label_visibility="collapsed", placeholder="학생명 입력").strip())
 
             missing_name_count = sum(not name for name in batch_student_names)
             if missing_name_count:
                 st.warning(f"학생명이 비어 있는 파일이 {missing_name_count}개 있습니다.")
-            start_batch_disabled = ui_locked or bool(missing_name_count) or has_blocking_startup_issue
-            if st.button(
-                f"선택한 녹음 {len(batch_uploaded_files)}개 순차 처리",
+            start_batch_disabled = ui_locked or retained_batch or bool(missing_name_count) or has_blocking_startup_issue
+            if audio_action_placeholder.button(
+                "정리하고 ADMIN 저장",
                 disabled=start_batch_disabled,
                 type="primary",
                 use_container_width=True,
@@ -10195,38 +10538,27 @@ def main() -> None:
 
         can_run = bool(student_name.strip()) and selected_audio_label is not None and not has_blocking_startup_issue
         is_processing = st.session_state.get("is_processing", False)
-        button_disabled = (not can_run) or is_processing
+        button_disabled = (not can_run) or is_processing or retained_batch
 
         def start_single_consultation_job() -> None:
+            if selected_audio_path is None:
+                return
             if not prepare_codex_summary_processing():
                 return
-            st.session_state["is_processing"] = True
-            st.session_state["pending_main_run"] = True
-            st.session_state["latest_summary"] = ""
-            st.session_state["summary_generation_failed"] = False
-            st.session_state["summary_status"] = ""
-            st.session_state["summary_retry_available"] = False
-            st.session_state["summary_generation_diagnostics"] = {}
-            st.session_state["post_run_success"] = ""
-            st.session_state["post_run_toast"] = ""
-            st.session_state["post_run_warning"] = ""
-            st.session_state["post_run_error"] = ""
-            st.session_state["current_job_snapshot"] = {
-                "student_name": student_name.strip(),
-                "author_name": author_name.strip() or get_default_author_name(),
-                "counseling_date": counseling_date.isoformat(),
-                "audio_path": str(selected_audio_path),
-                "processing_mode": processing_mode,
-                "summary_style": summary_style,
-                "use_academy_glossary": True,
-                "use_vad": use_vad_filter,
-                "use_prompt_hint": use_prompt_hint,
-            }
+            job = create_audio_batch_job(audio_path=str(selected_audio_path), source_name=selected_audio_path.name,
+                student_name=student_name.strip(), author_name=author_name.strip() or get_default_author_name(),
+                counseling_date=counseling_date.isoformat(), processing_mode=processing_mode,
+                summary_style=summary_style, use_vad=use_vad_filter, use_prompt_hint=use_prompt_hint)
+            persist_audio_batch_session_state(create_audio_batch_state([job], audio_batch_now_iso()))
+            st.session_state.pop("audio_batch_summary_choice", None)
+            start_next_audio_batch_job()
 
         if upload_mode in {"empty", "single"}:
-            audio_action_placeholder.button("정리본 생성·복사",
+            audio_action_placeholder.button("정리하고 ADMIN 저장",
                 disabled=button_disabled,
                 on_click=start_single_consultation_job,
+                type="primary",
+                width="stretch",
             )
 
         if st.session_state.get("pending_main_run"):
@@ -10239,6 +10571,8 @@ def main() -> None:
                 counseling_date = st.session_state.get("counseling_date", get_today_kst())
             selected_audio_path = Path(snapshot["audio_path"]) if snapshot.get("audio_path") else None
             selected_audio_label = selected_audio_path.name if selected_audio_path else None
+            if selected_audio_path is not None and selected_audio_path.is_file():
+                request_recording_backup(BASE_DIR, selected_audio_path)
             processing_mode = snapshot.get("processing_mode", processing_mode)
             if processing_mode not in PROCESSING_MODES:
                 processing_mode = "균형 모드"
@@ -10248,7 +10582,7 @@ def main() -> None:
             compute_type = mode_config["compute_type"]
             summary_style = snapshot.get("summary_style", summary_style)
             if summary_style not in SUMMARY_STYLES:
-                summary_style = "기본 상담 정리"
+                summary_style = DEFAULT_SUMMARY_STYLE
             author_name = snapshot.get("author_name", author_name).strip() or get_default_author_name()
             use_academy_glossary = True
             use_vad_filter = bool(snapshot.get("use_vad", use_vad_filter))
@@ -10270,9 +10604,9 @@ def main() -> None:
                 st.session_state["current_transcript_path"] = batch_job["transcript_path"]
                 finish_active_audio_batch_job(
                     status="completed", detail="ADMIN 저장 재시도", transcript_path=batch_job["transcript_path"],
-                    summary=batch_job["summary"], pause_batch=False,
+                    summary=batch_job["summary"], pause_batch=False, auto_save_to_admin=True,
+                    refresh_status=lambda: render_progress(status_placeholder.container()),
                 )
-                save_audio_batch_job_to_admin(batch_job_id)
                 save_draft("ADMIN 저장")
                 st.rerun()
 
@@ -10347,6 +10681,8 @@ def main() -> None:
                         transcript_path=batch_item_transcript_path,
                         summary=batch_item_summary,
                         pause_batch=pause_audio_batch,
+                        auto_save_to_admin=True,
+                        refresh_status=lambda: render_progress(status_placeholder.container()),
                     )
                     save_draft(st.session_state.get("last_step", "정리본 생성"))
                     st.rerun()
@@ -10794,6 +11130,8 @@ def main() -> None:
                         transcript_path=batch_item_transcript_path,
                         summary=batch_item_summary,
                         pause_batch=pause_audio_batch,
+                        auto_save_to_admin=True,
+                        refresh_status=lambda: render_progress(status_placeholder.container()),
                     )
                 else:
                     st.session_state["is_processing"] = False
@@ -11095,6 +11433,7 @@ def main() -> None:
                         edited_text,
                         st.session_state.get("summary_status"),
                     ),
+                    auto_save=True,
                 )
                 if show_developer_diagnostics:
                     if st.button("수정본 복사하기"):
