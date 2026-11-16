@@ -77,6 +77,7 @@ _check_startup_required_files()
 from counsel_modules.audio_batch_review import AudioBatchReviewActions, render_audio_batch_summary_review
 from counsel_modules.admin_note_merge import AdminSummaryMergeConflict, merge_admin_summary, normalized_admin_notes
 from counsel_modules import openai_processing
+from counsel_modules.docs_qa_auth import post_docs
 from counsel_modules.audio_workflow_ui import audio_workflow_counts, render_audio_processing_log, render_audio_workflow_overview
 from counsel_modules.recording_backup_worker import (
     recording_backup_is_running, recording_backup_warning, request_recording_backup, retry_recording_backup,
@@ -1240,7 +1241,7 @@ def append_summary_to_google_doc(
         ).strip(),
     }
     try:
-        request_callable = post_request or requests.post
+        request_callable = post_request or post_docs
         response = request_callable(
             cleaned_web_app_url,
             json=payload,
@@ -1374,7 +1375,7 @@ def verify_summary_in_google_doc_after_timeout(
         ).strip(),
     }
     try:
-        request_callable = post_request or requests.post
+        request_callable = post_request or post_docs
         response = request_callable(
             cleaned_web_app_url,
             json=payload,
