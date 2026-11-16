@@ -24,7 +24,10 @@ import pyperclip
 import streamlit as st
 import streamlit.components.v1 as components
 from streamlit.delta_generator import DeltaGenerator
-from streamlit.errors import StreamlitInvalidLayoutContextError
+try:
+    from streamlit.errors import StreamlitInvalidLayoutContextError
+except ImportError:
+    from streamlit.errors import StreamlitAPIException as StreamlitInvalidLayoutContextError
 
 
 _STARTUP_REQUIRED_FILES = [
