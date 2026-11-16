@@ -76,7 +76,17 @@ _check_startup_required_files()
 
 from counsel_modules.audio_batch_review import AudioBatchReviewActions, render_audio_batch_summary_review
 from counsel_modules.admin_note_merge import AdminSummaryMergeConflict, merge_admin_summary, normalized_admin_notes
+from counsel_modules.admin_workspace import (
+    ASSERTION_HEADER,
+    AdminWorkspace,
+    WorkspaceAccessError,
+    current_worker_workspace,
+    hosted_mode_enabled,
+    use_worker_workspace,
+    verified_workspace,
+)
 from counsel_modules import openai_processing
+from counsel_modules.atomic_json import write_json_atomic
 from counsel_modules.docs_qa_auth import post_docs
 from counsel_modules.audio_workflow_ui import audio_workflow_counts, render_audio_processing_log, render_audio_workflow_overview
 from counsel_modules.recording_backup_worker import (
@@ -527,18 +537,42 @@ def ensure_admin_settings_files() -> None:
         ADMIN_API_BASE_URL_PATH.write_text(DEFAULT_ADMIN_API_BASE_URL, encoding="utf-8")
 
 
+ADMIN_WORKSPACE_SESSION_KEY = "_connect_log_admin_workspace"
+
+
+def current_admin_workspace() -> AdminWorkspace | None:
+    if not hosted_mode_enabled():
+        return None
+    worker_workspace = current_worker_workspace()
+    if worker_workspace is not None:
+        return worker_workspace
+    workspace = verified_workspace(
+        BASE_DIR,
+        st.context.headers.get_all(ASSERTION_HEADER),
+        os.environ.get("CONNECT_LOG_ADMIN_PROXY_SECRET", ""),
+    )
+    if st.session_state.get(ADMIN_WORKSPACE_SESSION_KEY, workspace.root.name) != workspace.root.name:
+        raise WorkspaceAccessError("ADMIN identity changed in an existing session")
+    return workspace
+
+
+def work_path(path: Path) -> Path:
+    workspace = current_admin_workspace()
+    return path if workspace is None else workspace.path_for(path)
+
+
 def ensure_project_structure() -> list[str]:
     warnings: list[str] = []
     for folder in [
         BASE_DIR / "data",
-        TRANSCRIPT_DIR,
-        DRAFT_DIR,
-        UPLOAD_DIR,
-        TMP_DIR,
+        work_path(TRANSCRIPT_DIR),
+        work_path(DRAFT_DIR),
+        work_path(UPLOAD_DIR),
+        work_path(TMP_DIR),
         GLOSSARY_DIR,
         STUDENTS_DIR,
-        ADMIN_NOTES_BACKUP_DIR,
-        GOOGLE_DOCS_APPEND_LOG_DIR,
+        work_path(ADMIN_NOTES_BACKUP_DIR),
+        work_path(GOOGLE_DOCS_APPEND_LOG_DIR),
         BASE_DIR / "prompts",
         BASE_DIR / "scripts",
     ]:
@@ -1455,6 +1489,8 @@ def read_log_export_csv(uploaded_file) -> tuple[list[dict[str, str]], list[str],
 
 
 def default_log_csv_downloads_dir() -> Path:
+    if hosted_mode_enabled():
+        return work_path(BASE_DIR / "data" / "csv_imports")
     user_profile = os.environ.get("USERPROFILE", "").strip()
     return (Path(user_profile) if user_profile else Path.home()) / "Downloads"
 
@@ -1471,7 +1507,7 @@ def log_csv_batch_now_iso() -> str:
 
 def load_current_log_csv_processing_history() -> LogCsvProcessingHistory | None:
     try:
-        history = load_log_csv_processing_history(LOG_CSV_PROCESSING_HISTORY_PATH)
+        history = load_log_csv_processing_history(work_path(LOG_CSV_PROCESSING_HISTORY_PATH))
     except LogCsvProcessingHistoryError as exc:
         st.session_state["log_csv_processing_history_error"] = str(exc)
         return None
@@ -1481,8 +1517,8 @@ def load_current_log_csv_processing_history() -> LogCsvProcessingHistory | None:
 
 def persist_current_log_csv_processing_history(history: LogCsvProcessingHistory) -> bool:
     try:
-        with CsvRunLease(LOG_CSV_WORKER_LOCK_PATH):
-            merged = load_log_csv_processing_history(LOG_CSV_PROCESSING_HISTORY_PATH)
+        with CsvRunLease(work_path(LOG_CSV_WORKER_LOCK_PATH)):
+            merged = load_log_csv_processing_history(work_path(LOG_CSV_PROCESSING_HISTORY_PATH))
             for entry in history["entries"]:
                 previous = find_log_csv_history_entry(merged, entry["csv_hash"])
                 if previous is not None and (
@@ -1494,7 +1530,7 @@ def persist_current_log_csv_processing_history(history: LogCsvProcessingHistory)
                 ):
                     continue
                 merged = upsert_log_csv_history_entry(merged, entry)
-            save_log_csv_processing_history(LOG_CSV_PROCESSING_HISTORY_PATH, merged)
+            save_log_csv_processing_history(work_path(LOG_CSV_PROCESSING_HISTORY_PATH), merged)
     except (OSError, TypeError, ValueError, CsvRunBusyError, LogCsvProcessingHistoryError) as exc:
         st.session_state["log_csv_processing_history_error"] = str(exc)
         return False
@@ -1635,7 +1671,7 @@ def cached_confirmed_students_from_history_export(
 def current_log_csv_saved_student_keys() -> set[tuple[str, str]] | None:
     saved_students: set[tuple[str, str]] = set()
     try:
-        for path in GOOGLE_DOCS_APPEND_LOG_DIR.glob("log_csv_to_docs_result_*.csv"):
+        for path in work_path(GOOGLE_DOCS_APPEND_LOG_DIR).glob("log_csv_to_docs_result_*.csv"):
             stat = path.stat()
             saved_students.update(
                 load_log_csv_saved_student_keys(str(path), stat.st_mtime_ns, stat.st_size)
@@ -1782,12 +1818,12 @@ def refresh_log_csv_processing_history_summary(
 
 
 def load_current_log_csv_batch_state() -> LogCsvBatchState | None:
-    return load_log_csv_batch_state(LOG_CSV_DOCS_STATE_PATH)
+    return load_log_csv_batch_state(work_path(LOG_CSV_DOCS_STATE_PATH))
 
 
 def persist_current_log_csv_batch_state(state: LogCsvBatchState) -> bool:
     try:
-        save_log_csv_batch_state(LOG_CSV_DOCS_STATE_PATH, state)
+        save_log_csv_batch_state(work_path(LOG_CSV_DOCS_STATE_PATH), state)
     except (OSError, TypeError, ValueError) as exc:
         st.session_state["log_csv_to_docs_checkpoint_error"] = str(exc)
         return False
@@ -1796,13 +1832,13 @@ def persist_current_log_csv_batch_state(state: LogCsvBatchState) -> bool:
 
 
 def release_stale_log_csv_session_lock() -> None:
-    if csv_worker_is_running(LOG_CSV_WORKER_LOCK_PATH):
+    if csv_worker_is_running(work_path(LOG_CSV_WORKER_LOCK_PATH)):
         st.session_state["log_csv_to_docs_is_saving"] = False
         return
     state = load_current_log_csv_batch_state()
     if state is not None and state["status"] == "running":
         try:
-            with CsvRunLease(LOG_CSV_WORKER_LOCK_PATH):
+            with CsvRunLease(work_path(LOG_CSV_WORKER_LOCK_PATH)):
                 state = load_current_log_csv_batch_state()
                 if state is not None and state["status"] == "running":
                     position = int(state.get("current_position") or 0) - 1
@@ -1926,7 +1962,7 @@ def render_log_csv_persisted_progress(upload_signature_hash: str) -> None:
     remaining = max(0, total - completed)
     percent = int((completed / total) * 100) if total else 0
     status = str(state.get("status") or "")
-    recently_running = csv_worker_is_running(LOG_CSV_WORKER_LOCK_PATH)
+    recently_running = csv_worker_is_running(work_path(LOG_CSV_WORKER_LOCK_PATH))
     if recently_running:
         st.session_state["log_csv_observed_worker_run"] = state.get("run_id")
     elif st.session_state.pop("log_csv_observed_worker_run", None):
@@ -2035,7 +2071,7 @@ def render_log_csv_auto_import_watcher() -> None:
     )
     if st.session_state.get("log_csv_to_docs_is_saving", False):
         return
-    if csv_worker_is_running(LOG_CSV_WORKER_LOCK_PATH):
+    if csv_worker_is_running(work_path(LOG_CSV_WORKER_LOCK_PATH)):
         return
     current_run_state = load_current_log_csv_batch_state()
     if log_csv_completion_is_pending(current_run_state):
@@ -2304,14 +2340,15 @@ def render_app_health_diagnostics(ui_locked: bool) -> None:
 
 
 def unique_google_docs_append_log_path(timestamp: str) -> Path:
-    GOOGLE_DOCS_APPEND_LOG_DIR.mkdir(parents=True, exist_ok=True)
-    base_path = GOOGLE_DOCS_APPEND_LOG_DIR / f"log_csv_to_docs_result_{timestamp}.csv"
+    result_dir = work_path(GOOGLE_DOCS_APPEND_LOG_DIR)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    base_path = result_dir / f"log_csv_to_docs_result_{timestamp}.csv"
     if not base_path.exists():
         return base_path
 
     counter = 2
     while True:
-        candidate = GOOGLE_DOCS_APPEND_LOG_DIR / f"log_csv_to_docs_result_{timestamp}_{counter}.csv"
+        candidate = result_dir / f"log_csv_to_docs_result_{timestamp}_{counter}.csv"
         if not candidate.exists():
             return candidate
         counter += 1
@@ -4786,11 +4823,11 @@ def auto_deselect_log_csv_duplicate_selection(
 
 
 def record_csv_worker_failure(error: BaseException, initial_state: LogCsvBatchState) -> None:
-    state = load_log_csv_batch_state(LOG_CSV_DOCS_STATE_PATH)
+    state = load_log_csv_batch_state(work_path(LOG_CSV_DOCS_STATE_PATH))
     if state is None or state.get("run_id") != initial_state.get("run_id"):
         state = initial_state
     save_log_csv_batch_state(
-        LOG_CSV_DOCS_STATE_PATH,
+        work_path(LOG_CSV_DOCS_STATE_PATH),
         interrupt_log_csv_batch_state(
             state, error=str(error)[:500], updated_at=log_csv_batch_now_iso(),
         ),
@@ -4806,14 +4843,14 @@ def execute_log_csv_transfer(
 ) -> None:
 
     def persist_batch(state):
-        save_log_csv_batch_state(LOG_CSV_DOCS_STATE_PATH, state)
+        save_log_csv_batch_state(work_path(LOG_CSV_DOCS_STATE_PATH), state)
         return True
 
     def persist_history(history):
         # Only this run's entry belongs to the worker's snapshot.
-        latest = load_log_csv_processing_history(LOG_CSV_PROCESSING_HISTORY_PATH)
+        latest = load_log_csv_processing_history(work_path(LOG_CSV_PROCESSING_HISTORY_PATH))
         latest = upsert_log_csv_history_entry(latest, history_entry)
-        save_log_csv_processing_history(LOG_CSV_PROCESSING_HISTORY_PATH, latest)
+        save_log_csv_processing_history(work_path(LOG_CSV_PROCESSING_HISTORY_PATH), latest)
         return True
 
     persist_batch(run_state)
@@ -5235,10 +5272,12 @@ def render_log_csv_to_docs_preview_ui(
     pending_admin_sync: AdminNotesSyncRequest | None = None,
 ) -> None:
     release_stale_log_csv_session_lock()
-    restore_log_csv_auto_import_from_batch_state()
-    render_log_csv_auto_import_watcher()
-    auto_imported_log_csv = active_auto_import_log_csv()
-    worker_running = csv_worker_is_running(LOG_CSV_WORKER_LOCK_PATH)
+    auto_imported_log_csv = None
+    if not hosted_mode_enabled():
+        restore_log_csv_auto_import_from_batch_state()
+        render_log_csv_auto_import_watcher()
+        auto_imported_log_csv = active_auto_import_log_csv()
+    worker_running = csv_worker_is_running(work_path(LOG_CSV_WORKER_LOCK_PATH))
     recovery_state = load_current_log_csv_batch_state()
     if worker_running:
         st.session_state["log_csv_worker_progress_open"] = True
@@ -5593,7 +5632,7 @@ def render_log_csv_to_docs_preview_ui(
             if (
                 not history_processing_blocked and persisted_batch_state is not None
                 and str(persisted_batch_state.get("updated_at") or "") >= history_entry["updated_at"]
-                and not csv_worker_is_running(LOG_CSV_WORKER_LOCK_PATH)
+                and not csv_worker_is_running(work_path(LOG_CSV_WORKER_LOCK_PATH))
                 and history_seed_results
                 and history_seed_result_indices.issubset(set(range(len(matched_rows))))
                 and set(persisted_batch_state["completed_indices"]) == history_seed_result_indices
@@ -5673,7 +5712,7 @@ def render_log_csv_to_docs_preview_ui(
                         history_summary_placeholder,
                         processing_history,
                     )
-        persisted_run_recently_active = csv_worker_is_running(LOG_CSV_WORKER_LOCK_PATH)
+        persisted_run_recently_active = csv_worker_is_running(work_path(LOG_CSV_WORKER_LOCK_PATH))
         is_saving_docs = bool(
             st.session_state.get("log_csv_to_docs_is_saving", False)
             or persisted_run_recently_active
@@ -5778,16 +5817,16 @@ def render_log_csv_to_docs_preview_ui(
                     rechecked_state, result_log_path="", updated_at=updated_at,
                 )
                 try:
-                    with CsvRunLease(LOG_CSV_WORKER_LOCK_PATH):
-                        latest_history = load_log_csv_processing_history(LOG_CSV_PROCESSING_HISTORY_PATH)
+                    with CsvRunLease(work_path(LOG_CSV_WORKER_LOCK_PATH)):
+                        latest_history = load_log_csv_processing_history(work_path(LOG_CSV_PROCESSING_HISTORY_PATH))
                         latest_entry = find_log_csv_history_entry(latest_history, history_entry["csv_hash"])
                         if latest_entry is not None and latest_entry != history_entry:
                             return False
                         if load_current_log_csv_batch_state() != loaded_batch_state:
                             return False
-                        save_log_csv_batch_state(LOG_CSV_DOCS_STATE_PATH, rechecked_state)
+                        save_log_csv_batch_state(work_path(LOG_CSV_DOCS_STATE_PATH), rechecked_state)
                         save_log_csv_processing_history(
-                            LOG_CSV_PROCESSING_HISTORY_PATH,
+                            work_path(LOG_CSV_PROCESSING_HISTORY_PATH),
                             upsert_log_csv_history_entry(latest_history, rechecked_entry),
                         )
                 except (OSError, CsvRunBusyError, LogCsvProcessingHistoryError):
@@ -6334,11 +6373,21 @@ def render_log_csv_to_docs_preview_ui(
                 "web_app_url": web_app_url,
             })
             st.session_state["log_csv_to_docs_is_saving"] = False
+            workspace = current_admin_workspace()
+
+            def run_transfer() -> None:
+                with use_worker_workspace(workspace):
+                    execute_log_csv_transfer(**transfer_args)
+
+            def fail_transfer(exc: BaseException) -> None:
+                with use_worker_workspace(workspace):
+                    record_csv_worker_failure(exc, transfer_args["run_state"])
+
             try:
                 start_csv_worker(
-                    LOG_CSV_WORKER_LOCK_PATH,
-                    lambda: execute_log_csv_transfer(**transfer_args),
-                    lambda exc: record_csv_worker_failure(exc, transfer_args["run_state"]),
+                    work_path(LOG_CSV_WORKER_LOCK_PATH),
+                    run_transfer,
+                    fail_transfer,
                 )
             except (CsvRunBusyError, OSError) as exc:
                 st.error(str(exc))
@@ -7080,13 +7129,14 @@ def backup_admin_notes(
     admin_api_base_url: str,
     existing_notes: str,
 ) -> Path:
-    ADMIN_NOTES_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    backup_dir = work_path(ADMIN_NOTES_BACKUP_DIR)
+    backup_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d_%H%M%S")
     safe_name = sanitize_filename_part(student_name)
     safe_sid = sanitize_filename_part(admin_sid)
     safe_date = safe_date_for_filename(counseling_date_value)
     backup_path = (
-        ADMIN_NOTES_BACKUP_DIR
+        backup_dir
         / f"{safe_name}_{safe_date}_{safe_sid}_before_admin_notes_{timestamp}.txt"
     )
     content = "\n".join(
@@ -7348,7 +7398,8 @@ def render_admin_notes_save_ui(
             if lookup_error:
                 with st.expander("admin \ud559\uc0dd \ubaa9\ub85d \uc870\ud68c \uc0c1\uc138", expanded=False):
                     st.caption(str(lookup_error))
-            render_admin_sid_mapping_editor(clean_student_name, disabled=ui_locked)
+            if not hosted_mode_enabled():
+                render_admin_sid_mapping_editor(clean_student_name, disabled=ui_locked)
     elif len(sid_candidates) > 1:
         candidate_labels = [
             format_admin_sid_candidate_label(candidate)
@@ -7628,7 +7679,7 @@ def sanitize_filename_part(value: str) -> str:
 
 
 def transcript_date_dir(counseling_date: date) -> Path:
-    return TRANSCRIPT_DIR / counseling_date.isoformat()
+    return work_path(TRANSCRIPT_DIR) / counseling_date.isoformat()
 
 
 def safe_date_for_filename(counseling_date: date) -> str:
@@ -7700,10 +7751,11 @@ def audio_needs_whisper_wav_conversion(audio_path: Path) -> bool:
 
 
 def make_whisper_wav_path() -> Path:
-    WHISPER_AUDIO_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    audio_tmp_dir = work_path(WHISPER_AUDIO_TMP_DIR)
+    audio_tmp_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     millis = int(time.time() * 1000) % 1000
-    return WHISPER_AUDIO_TMP_DIR / f"whisper_input_{timestamp}_{millis:03d}_{os.getpid()}.wav"
+    return audio_tmp_dir / f"whisper_input_{timestamp}_{millis:03d}_{os.getpid()}.wav"
 
 
 def convert_audio_to_whisper_wav(audio_path: Path) -> tuple[Path, list[str], str, str]:
@@ -7756,9 +7808,10 @@ def write_extract_error_log(
     attempt_errors: list[str],
     conversion_command: list[str] | None = None,
 ) -> Path | None:
-    EXTRACT_ERROR_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    error_dir = work_path(EXTRACT_ERROR_LOG_DIR)
+    error_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = EXTRACT_ERROR_LOG_DIR / f"extract_error_{timestamp}_{os.getpid()}.txt"
+    log_path = error_dir / f"extract_error_{timestamp}_{os.getpid()}.txt"
     try:
         original_size = audio_path.stat().st_size if audio_path.exists() else "-"
     except OSError:
@@ -8652,9 +8705,10 @@ def run_configured_summary(prompt: str) -> str:
 
 
 def run_codex_summary(prompt: str) -> str:
+    work_temp = work_path(TMP_DIR)
     executable = _find_codex_executable()
     if executable is None:
-        build_codex_command(TMP_DIR / "codex_input.txt")
+        build_codex_command(work_temp / "codex_input.txt")
         raise FileNotFoundError("Codex CLI를 찾을 수 없습니다.")
     login_status = codex_login_status(executable)
     if login_status.state == "not_authenticated":
@@ -8664,8 +8718,8 @@ def run_codex_summary(prompt: str) -> str:
             f"returncode: {login_status.returncode if login_status.returncode is not None else '-'}\n"
             f"stderr:\n{login_status.detail or 'Not logged in'}"
         )
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
-    input_path = TMP_DIR / "codex_input.txt"
+    work_temp.mkdir(parents=True, exist_ok=True)
+    input_path = work_temp / "codex_input.txt"
     input_path.write_text(prompt, encoding="utf-8")
     invocations = _build_codex_invocations(
         executable=executable,
@@ -8757,6 +8811,8 @@ def sound_recording_candidate_dirs() -> list[Path]:
 
 
 def recording_candidate_dirs() -> list[Path]:
+    if hosted_mode_enabled():
+        return [work_path(UPLOAD_DIR)]
     return sound_recording_candidate_dirs()
 
 
@@ -9027,6 +9083,8 @@ def run_recording_cleanup_once_per_session() -> None:
 def copy_to_clipboard(text: str) -> tuple[bool, str | None]:
     if not text or not text.strip():
         return False, "복사할 정리본이 비어 있습니다."
+    if hosted_mode_enabled():
+        return False, "브라우저에서 정리본을 선택해 복사해 주세요."
     try:
         pyperclip.copy(text)
         return True, None
@@ -9135,12 +9193,13 @@ def safe_upload_path(filename: str) -> Path:
     original = Path(filename)
     safe_stem = sanitize_filename_part(original.stem)
     suffix = original.suffix.lower()
-    candidate = UPLOAD_DIR / f"{safe_stem}{suffix}"
+    upload_dir = work_path(UPLOAD_DIR)
+    candidate = upload_dir / f"{safe_stem}{suffix}"
     if not candidate.exists():
         return candidate
 
     for index in range(2, 1000):
-        numbered = UPLOAD_DIR / f"{safe_stem}_{index}{suffix}"
+        numbered = upload_dir / f"{safe_stem}_{index}{suffix}"
         if not numbered.exists():
             return numbered
 
@@ -9149,7 +9208,7 @@ def safe_upload_path(filename: str) -> Path:
 
 def save_uploaded_file_copy(uploaded_file) -> Path:
     validate_uploaded_extension(uploaded_file)
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    work_path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
     upload_key = f"{uploaded_file.name}|{uploaded_file.size}"
     if (
         st.session_state.get("uploaded_audio_key") == upload_key
@@ -9170,7 +9229,7 @@ def save_uploaded_file_copy(uploaded_file) -> Path:
 
 def save_audio_batch_upload_copy(uploaded_file) -> Path:
     validate_uploaded_extension(uploaded_file)
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    work_path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
     destination = safe_upload_path(uploaded_file.name)
     destination.write_bytes(uploaded_file.getbuffer())
     return destination
@@ -9181,7 +9240,7 @@ def audio_batch_now_iso() -> str:
 
 
 def persist_audio_batch_session_state(state: AudioBatchState) -> None:
-    save_audio_batch_state(AUDIO_BATCH_STATE_PATH, state)
+    save_audio_batch_state(work_path(AUDIO_BATCH_STATE_PATH), state)
     st.session_state["audio_batch_state"] = state
 
 
@@ -9194,16 +9253,17 @@ def clear_stalled_audio_batch_runtime_flags() -> None:
 def initialize_audio_batch_session_state() -> None:
     if st.session_state.get("audio_batch_initialized"):
         return
-    state = load_audio_batch_state(AUDIO_BATCH_STATE_PATH)
+    state_path = work_path(AUDIO_BATCH_STATE_PATH)
+    state = load_audio_batch_state(state_path)
     if state is None:
-        if AUDIO_BATCH_STATE_PATH.exists():
+        if state_path.exists():
             st.session_state["audio_batch_load_warning"] = (
                 "이전 일괄 처리 상태를 읽지 못했습니다. 새 일괄 처리를 시작할 수 있습니다."
             )
         st.session_state["audio_batch_state"] = None
     elif state.get("acknowledged_at") and audio_batch_all_saved(state):
         st.session_state["audio_batch_state"] = None
-        if not delete_audio_batch_state(AUDIO_BATCH_STATE_PATH):
+        if not delete_audio_batch_state(state_path):
             st.session_state["audio_batch_load_warning"] = (
                 "완료된 이전 일괄 처리 상태 파일을 정리하지 못했습니다."
             )
@@ -9398,7 +9458,8 @@ def save_audio_batch_job_to_admin(job_id: str) -> None:
     next(item for item in saved["jobs"] if item["job_id"] == job_id)["admin_saved_export"] = export_text
     persist_audio_batch_session_state(saved)
     st.session_state["last_admin_notes_save_key"] = request.preview_key
-    request_recording_cleanup(BASE_DIR, next(item for item in saved["jobs"] if item["job_id"] == job_id))
+    if not hosted_mode_enabled():
+        request_recording_cleanup(BASE_DIR, next(item for item in saved["jobs"] if item["job_id"] == job_id))
 
 
 def save_completed_audio_batch_summaries() -> None:
@@ -9509,10 +9570,11 @@ def should_pause_audio_batch_for_codex_error(error: object) -> bool:
 
 
 def load_draft() -> dict:
-    if not CURRENT_DRAFT_PATH.exists():
+    draft_path = work_path(CURRENT_DRAFT_PATH)
+    if not draft_path.exists():
         return {}
     try:
-        return json.loads(CURRENT_DRAFT_PATH.read_text(encoding="utf-8"))
+        return json.loads(draft_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return {}
 
@@ -9523,7 +9585,6 @@ def parse_draft_counseling_date(value: object, fallback: date) -> date:
 
 def save_draft(last_step: str | None = None) -> None:
     try:
-        DRAFT_DIR.mkdir(parents=True, exist_ok=True)
         counseling_date = st.session_state.get("counseling_date", get_today_kst())
         if isinstance(counseling_date, date):
             counseling_date_value = counseling_date.isoformat()
@@ -9546,10 +9607,7 @@ def save_draft(last_step: str | None = None) -> None:
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         }
         st.session_state["last_step"] = draft["last_step"]
-        CURRENT_DRAFT_PATH.write_text(
-            json.dumps(draft, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        write_json_atomic(work_path(CURRENT_DRAFT_PATH), draft)
         st.session_state.pop("draft_save_error", None)
     except OSError as exc:
         st.session_state["draft_save_error"] = str(exc)
@@ -9657,13 +9715,12 @@ def clear_current_draft() -> None:
     if uploaded_path:
         path = Path(uploaded_path)
         try:
-            if path.exists() and UPLOAD_DIR.resolve() in path.resolve().parents:
+            if path.exists() and work_path(UPLOAD_DIR).resolve() in path.resolve().parents:
                 path.unlink()
         except OSError:
             pass
 
-    if CURRENT_DRAFT_PATH.exists():
-        CURRENT_DRAFT_PATH.unlink()
+    work_path(CURRENT_DRAFT_PATH).unlink(missing_ok=True)
 
     st.session_state.clear()
 
@@ -10040,10 +10097,21 @@ def render_recording_backup_status_ui() -> None:
 
 def main() -> None:
     st.set_page_config(page_title="5A Connect Log", layout="wide")
+    hosted = hosted_mode_enabled()
+    if hosted:
+        try:
+            workspace = current_admin_workspace()
+            if workspace is None:
+                raise WorkspaceAccessError("Hosted workspace required")
+            st.session_state[ADMIN_WORKSPACE_SESSION_KEY] = workspace.root.name
+        except WorkspaceAccessError:
+            st.error("기존 ADMIN 페이지에서 Connect Log를 다시 열어 주세요.")
+            st.stop()
     apply_ui_refresh_styles()
     structure_warnings = ensure_project_structure()
     ensure_default_glossary_file()
-    ensure_admin_settings_files()
+    if not hosted:
+        ensure_admin_settings_files()
     file_issues = check_required_project_files()
     initialize_draft_state()
     initialize_audio_batch_session_state()
@@ -10088,7 +10156,7 @@ def main() -> None:
     apply_pending_student_name_from_file()
     ui_locked = st.session_state.get("is_processing", False)
     app_last_modified_badge = format_app_last_modified_badge()
-    show_developer_diagnostics = st.sidebar.checkbox(
+    show_developer_diagnostics = not hosted and st.sidebar.checkbox(
         "개발자 진단 정보 표시",
         key="show_developer_diagnostics",
         disabled=ui_locked,
@@ -10099,8 +10167,9 @@ def main() -> None:
         render_app_health_diagnostics(ui_locked)
         render_consumed_admin_notes_diagnostics(ui_locked)
 
-    run_recording_cleanup_once_per_session()
-    run_app_maintenance_cleanup_once_per_session()
+    if not hosted:
+        run_recording_cleanup_once_per_session()
+        run_app_maintenance_cleanup_once_per_session()
     if show_developer_diagnostics and st.session_state.get("recording_cleanup_result"):
         cleanup_result = st.session_state.get("recording_cleanup_result") or {}
         with st.sidebar.expander("녹음 파일 자동 정리", expanded=False):
@@ -10163,7 +10232,8 @@ def main() -> None:
             doc_url = (current_google_doc or {}).get("doc_url", "")
             if doc_url:
                 st.link_button("학생 Docs 열기", doc_url)
-        render_google_apps_script_url_settings_ui(ui_locked)
+        if not hosted:
+            render_google_apps_script_url_settings_ui(ui_locked)
         counseling_date = st.date_input(
             "상담일",
             key="counseling_date_input",
@@ -10196,7 +10266,8 @@ def main() -> None:
         model_size = mode_config["model_size"]
         beam_size = mode_config["beam_size"]
         compute_type = mode_config["compute_type"]
-        render_google_docs_mapping_add_ui(ui_locked)
+        if not hosted:
+            render_google_docs_mapping_add_ui(ui_locked)
         use_academy_glossary = True
         use_vad_filter = bool(st.session_state.get("use_vad_filter", False))
         use_prompt_hint = bool(st.session_state.get("use_prompt_hint", False))
@@ -10377,7 +10448,8 @@ def main() -> None:
         render_progress(status_placeholder.container())
 
     with audio_details_container:
-        render_recording_backup_status_ui()
+        if not hosted:
+            render_recording_backup_status_ui()
         batch_state = st.session_state.get("audio_batch_state")
         batch_counts = audio_batch_counts(batch_state) if batch_state else None
         unfinished_batch = bool(
@@ -10610,7 +10682,7 @@ def main() -> None:
                 counseling_date = st.session_state.get("counseling_date", get_today_kst())
             selected_audio_path = Path(snapshot["audio_path"]) if snapshot.get("audio_path") else None
             selected_audio_label = selected_audio_path.name if selected_audio_path else None
-            if selected_audio_path is not None and selected_audio_path.is_file():
+            if not hosted and selected_audio_path is not None and selected_audio_path.is_file():
                 request_recording_backup(BASE_DIR, selected_audio_path)
             processing_mode = snapshot.get("processing_mode", processing_mode)
             if processing_mode not in PROCESSING_MODES:
