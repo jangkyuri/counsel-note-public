@@ -40,6 +40,7 @@ class AudioBatchJob(TypedDict):
     dual_save_sid: NotRequired[str]
     dual_save_doc_id: NotRequired[str]
     dual_save_subject: NotRequired[str]
+    recording_replay_key: NotRequired[str]
 
 
 class AudioBatchState(TypedDict):
@@ -117,6 +118,7 @@ def create_audio_batch_job(
         "admin_saved": False,
         "admin_sid": "",
         "admin_saved_export": "",
+        "recording_replay_key": "",
     }
 
 
@@ -356,6 +358,7 @@ def load_audio_batch_state(path: Path) -> AudioBatchState | None:
                     "dual_save_sid": str(raw_job.get("dual_save_sid", "")),
                     "dual_save_doc_id": str(raw_job.get("dual_save_doc_id", "")),
                     "dual_save_subject": str(raw_job.get("dual_save_subject", "")),
+                    "recording_replay_key": str(raw_job.get("recording_replay_key", "")),
                 }
             )
         raw_status = str(payload.get("status", "paused"))

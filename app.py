@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -93,7 +94,10 @@ from counsel_modules.atomic_json import write_json_atomic
 from counsel_modules.docs_qa_auth import post_docs
 from counsel_modules.audio_workflow_ui import audio_workflow_counts, render_audio_processing_log, render_audio_workflow_overview
 from counsel_modules.dual_save import Lesson, Outcome
-from counsel_modules.dual_save_runtime import SaveResult, enabled as dual_save_enabled, save_on_server
+from counsel_modules.dual_save_runtime import enabled as dual_save_enabled, save_on_server
+from counsel_modules.recording_replay import (
+    RecordingReplay, ReplayConflict, recording_replay_key, replay_key_matches_target,
+)
 from counsel_modules.recording_backup_worker import (
     recording_backup_is_running, recording_backup_warning, request_recording_backup, retry_recording_backup,
     request_recording_cleanup,
@@ -370,6 +374,7 @@ LOG_CSV_PROCESSING_HISTORY_PATH = BASE_DIR / "data" / "local_log_csv_processing_
 GOOGLE_DOCS_MAP_BACKUP_ROOT = BASE_DIR.parent / "counsel-note_BACKUPS"
 CURRENT_DRAFT_PATH = DRAFT_DIR / "current_draft.json"
 AUDIO_BATCH_STATE_PATH = DRAFT_DIR / "audio_batch_queue.json"
+RECORDING_REPLAY_PATH = DRAFT_DIR / "recording_replay.sqlite3"
 PROMPT_PATH = BASE_DIR / "prompts" / "summary_ko.txt"
 APP_VERSION_PATH = BASE_DIR / "APP_VERSION.txt"
 BUILD_INFO_PATH = BASE_DIR / "BUILD_INFO.json"
@@ -9305,6 +9310,40 @@ def audio_batch_job_snapshot(job: AudioBatchJob, position: int, total: int) -> d
     }
 
 
+def dual_recording_key(job: AudioBatchJob) -> str:
+    key = job.get("recording_replay_key", "")
+    path = Path(job["audio_path"])
+    if key and not path.is_file():
+        if not replay_key_matches_target(key, job["student_name"], job["counseling_date"]):
+            raise ReplayConflict()
+        return key
+    actual = recording_replay_key(path, job["student_name"], job["counseling_date"])
+    if key and key != actual:
+        raise ReplayConflict()
+    return actual
+
+
+def reuse_prepared_recording(job: AudioBatchJob) -> AudioBatchJob:
+    key = dual_recording_key(job)
+    item = RecordingReplay(work_path(RECORDING_REPLAY_PATH)).find(key)
+    job = {**job, "recording_replay_key": key}
+    if item is not None and not job["summary"]:
+        previous = item.result
+        job.update(
+            summary=item.summary, admin_saved=previous.admin.verified, docs_saved=previous.docs.verified,
+            admin_sid=previous.sid, dual_save_sid=previous.sid, dual_save_doc_id=previous.doc_id,
+            dual_save_subject=previous.subject,
+        )
+    return job
+
+
+def mark_recording_replay_review(state: AudioBatchState, job: AudioBatchJob, detail: str) -> None:
+    persist_audio_batch_session_state(update_audio_batch_job(
+        state, job["job_id"], status="needs_review", detail=detail, transcript_path=job["transcript_path"],
+        summary=job["summary"], updated_at=audio_batch_now_iso(),
+    ))
+
+
 def start_next_audio_batch_job() -> bool:
     state = st.session_state.get("audio_batch_state")
     if not state:
@@ -9329,6 +9368,15 @@ def start_next_audio_batch_job() -> bool:
         return False
 
     index, job = next_job
+    if dual_save_enabled():
+        try:
+            job = reuse_prepared_recording(job)
+        except (OSError, sqlite3.Error, ReplayConflict):
+            mark_recording_replay_review(state, job, "녹음 원본이나 기존 작업을 확인할 수 없어 저장하지 않았습니다.")
+            return start_next_audio_batch_job()
+        jobs = list(state["jobs"])
+        jobs[index] = job
+        state = {**state, "jobs": jobs}
     processing_state = update_audio_batch_job(
         state,
         job["job_id"],
@@ -9414,12 +9462,19 @@ def save_audio_batch_job_to_both(state: AudioBatchState, job: AudioBatchJob) -> 
     if not export_text or not summary_copy_save_allowed(job["summary"], SUMMARY_STATUS_READY):
         return
     job_id = job["job_id"]
-    sid = job.get("dual_save_sid", "")
-    previous = SaveResult(
-        Outcome.EXISTING if sid and job.get("admin_saved") else Outcome.PENDING,
-        Outcome.EXISTING if sid and job.get("docs_saved") else Outcome.PENDING,
-        sid, job.get("dual_save_doc_id", ""), job.get("dual_save_subject", ""),
-    )
+    try:
+        key = dual_recording_key(job)
+        history = RecordingReplay(work_path(RECORDING_REPLAY_PATH))
+        item = history.claim(key, job["summary"], export_text)
+        job["recording_replay_key"] = key
+        if item.summary != job["summary"]:
+            mark_recording_replay_review(state, job, "같은 녹음에 다른 정리본이 있어 기존 저장 내용을 유지했습니다.")
+            return
+    except (OSError, sqlite3.Error, ReplayConflict):
+        mark_recording_replay_review(state, job, "기존 녹음 작업을 확인할 수 없어 저장하지 않았습니다.")
+        return
+    previous = item.result
+    export_text = item.export
     docs_map = []
     for row in load_google_docs_map_rows():
         url_id = extract_google_docs_doc_id(row["doc_url"])
@@ -9429,15 +9484,21 @@ def save_audio_batch_job_to_both(state: AudioBatchState, job: AudioBatchJob) -> 
         docs_map.append((row["student_name"], doc_id or url_id))
 
     def record_target(lesson: Lesson, doc_id: str) -> None:
+        history.bind(key, lesson.sid, doc_id, lesson.subject)
         job["dual_save_sid"] = lesson.sid
         job["dual_save_doc_id"] = doc_id
         job["dual_save_subject"] = lesson.subject
         persist_audio_batch_session_state(state)
 
-    result = save_on_server(
-        job["student_name"], date.fromisoformat(job["counseling_date"]),
-        export_text, docs_map, previous, record_target,
-    )
+    try:
+        result = save_on_server(
+            job["student_name"], date.fromisoformat(job["counseling_date"]),
+            export_text, docs_map, previous, record_target,
+        )
+        history.confirm(key, result)
+    except (OSError, sqlite3.Error, ReplayConflict):
+        mark_recording_replay_review(state, job, "녹음 작업의 대상이나 저장 상태를 확인해야 합니다.")
+        return
     admin_ok = result.admin.verified
     docs_ok = result.docs.verified
     status_label = {
@@ -10781,8 +10842,10 @@ def main() -> None:
                 batch_job = next(job for job in st.session_state["audio_batch_state"]["jobs"] if job["job_id"] == batch_job_id)
                 st.session_state["latest_summary"] = batch_job["summary"]
                 st.session_state["current_transcript_path"] = batch_job["transcript_path"]
+                reused = dual_save_enabled() and batch_job.get("admin_saved") and batch_job.get("docs_saved")
                 finish_active_audio_batch_job(
-                    status="completed", detail="ADMIN 저장 재시도", transcript_path=batch_job["transcript_path"],
+                    status="completed", detail="ADMIN·Docs 기존 작업 재사용" if reused else "ADMIN 저장 재시도",
+                    transcript_path=batch_job["transcript_path"],
                     summary=batch_job["summary"], pause_batch=False, auto_save_to_admin=True,
                     refresh_status=lambda: render_progress(status_placeholder.container()),
                 )

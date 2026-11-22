@@ -24,8 +24,11 @@ def test_prepared_job_uses_existing_save_entrypoint_and_resumes_partial_result(
 ) -> None:
     app = load_app(Path(__file__).resolve().parents[1], None)
     monkeypatch.setenv("CONNECT_LOG_DUAL_SAVE_ENABLED", "1")
+    audio = tmp_path / "synthetic.wav"
+    audio.write_bytes(b"QA synthetic sound")
+    monkeypatch.setattr(app, "RECORDING_REPLAY_PATH", tmp_path / "recordings.sqlite3")
     job = create_audio_batch_job(
-        audio_path="synthetic.wav", source_name="synthetic.wav", student_name="QA Student",
+        audio_path=str(audio), source_name="synthetic.wav", student_name="QA Student",
         author_name="QA", counseling_date=STAMP[:10], processing_mode="qa",
         summary_style="qa", use_vad=False, use_prompt_hint=False,
     )
@@ -40,7 +43,7 @@ def test_prepared_job_uses_existing_save_entrypoint_and_resumes_partial_result(
     monkeypatch.setattr(app, "st", SimpleNamespace(session_state=state))
     monkeypatch.setattr(app, "persist_audio_batch_session_state", persist)
     monkeypatch.setattr(app, "audio_batch_now_iso", lambda: STAMP)
-    monkeypatch.setattr(app, "summary_copy_save_allowed", lambda *args: True)
+    monkeypatch.setattr(app, "summary_copy_save_allowed", lambda value, *_: bool(value))
     monkeypatch.setattr(app, "admin_notes_export_text_from_summary", lambda **kw: (kw["summary_text"], "QA"))
     monkeypatch.setattr(app, "load_google_docs_map_rows", lambda: [
         {"student_name": "QA Student", "doc_id": DOC, "doc_url": ""},
@@ -69,6 +72,26 @@ def test_prepared_job_uses_existing_save_entrypoint_and_resumes_partial_result(
     app.save_audio_batch_job_to_admin(job["job_id"])
     assert calls == [Outcome.PENDING, Outcome.EXISTING]
     assert app.audio_batch_all_saved(state["audio_batch_state"])
+    # Completion can be acknowledged and the queue replaced with a new upload of the same bytes.
+    renamed = tmp_path / "renamed.wav"
+    renamed.write_bytes(audio.read_bytes())
+    new_job = {**job, "source_name": renamed.name, "audio_path": str(renamed),
+               "job_id": "another upload", "summary": "", "status": "pending"}
+    state["audio_batch_state"] = create_audio_batch_state([new_job], STAMP)
+    assert app.start_next_audio_batch_job()
+    replay = state["audio_batch_state"]["jobs"][0]
+    assert replay["summary"] == "QA-ADD"
+    assert state["current_job_snapshot"]["resume_admin_save_only"] is True
+    app.save_audio_batch_job_to_admin(replay["job_id"])
+    assert calls == [Outcome.PENDING, Outcome.EXISTING]
+    assert replay["admin_saved"] and replay["docs_saved"]
+
+    # A stale concurrent result with different wording must not reach either store.
+    divergent = {**new_job, "summary": "second model output", "status": "completed"}
+    state["audio_batch_state"] = create_audio_batch_state([divergent], STAMP)
+    app.save_audio_batch_job_to_admin(divergent["job_id"])
+    assert calls == [Outcome.PENDING, Outcome.EXISTING]
+    assert state["audio_batch_state"]["jobs"][0]["status"] == "needs_review"
 
 
 def test_partial_save_display_does_not_claim_complete(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -40,5 +40,16 @@ Google Docs revision to avoid concurrent replacement. A lost write response
 causes another read, not a blind write. After restart, the existing retry action
 can reuse the prepared summary and skip an already verified destination.
 
+Recording replay state lives in each existing private workspace's
+`data/drafts/recording_replay.sqlite3` path. Keep that database with the workspace
+across restarts and releases. A matching file SHA-256, exact normalized student
+name and counseling date reuse the first prepared summary; the first resolved
+SID, subject and Docs ID are then pinned. A changed summary cannot trigger a
+second automatic write. The record stores destination confirmations separately
+and does not contain audio bytes or credentials. It does not backfill completed
+uploads made before the replay database was introduced. Use a fresh synthetic
+recording once, then upload those identical bytes again to verify replay.
+Include `tests/test_recording_replay.py` in isolated QA.
+
 Google Docs write contract:
 https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/batchUpdate
