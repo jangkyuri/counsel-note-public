@@ -1,0 +1,2 @@
+google-auth[requests]>=2.40,<3
+httpx2[http2,brotli,zstd]>=2.0,<3

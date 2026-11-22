@@ -36,6 +36,10 @@ class AudioBatchJob(TypedDict):
     admin_saved: NotRequired[bool]
     admin_sid: NotRequired[str]
     admin_saved_export: NotRequired[str]
+    docs_saved: NotRequired[bool]
+    dual_save_sid: NotRequired[str]
+    dual_save_doc_id: NotRequired[str]
+    dual_save_subject: NotRequired[str]
 
 
 class AudioBatchState(TypedDict):
@@ -173,6 +177,7 @@ def update_audio_batch_job(
                 if job.get("admin_saved") and not job.get("admin_saved_export"):
                     job["admin_saved_export"] = job["summary"]
                 job["admin_saved"] = False
+                job["docs_saved"] = False
             job["summary"] = summary
             job["updated_at"] = updated_at
             if increment_attempts:
@@ -290,11 +295,12 @@ def resume_audio_batch_state(state: AudioBatchState, updated_at: str) -> AudioBa
     return set_audio_batch_status(state, "running", updated_at)
 
 
-def prepare_audio_batch_retry(state: AudioBatchState, updated_at: str) -> AudioBatchState:
+def prepare_audio_batch_retry(state: AudioBatchState, updated_at: str, *, require_docs: bool = False) -> AudioBatchState:
     jobs: list[AudioBatchJob] = []
     for current in state["jobs"]:
         job = current.copy()
-        if job["status"] in {"failed", "needs_review"} or (job["status"] == "completed" and not job.get("admin_saved")):
+        incomplete = not job.get("admin_saved") or (require_docs and not job.get("docs_saved"))
+        if job["status"] in {"failed", "needs_review"} or (job["status"] == "completed" and incomplete):
             job["status"] = "pending"
             job["detail"] = "문제 파일 다시 처리 대기 중"
             job["updated_at"] = updated_at
@@ -346,6 +352,10 @@ def load_audio_batch_state(path: Path) -> AudioBatchState | None:
                     "admin_saved": raw_job.get("admin_saved") is True,
                     "admin_sid": str(raw_job.get("admin_sid", "")),
                     "admin_saved_export": str(raw_job.get("admin_saved_export", "")),
+                    "docs_saved": raw_job.get("docs_saved") is True,
+                    "dual_save_sid": str(raw_job.get("dual_save_sid", "")),
+                    "dual_save_doc_id": str(raw_job.get("dual_save_doc_id", "")),
+                    "dual_save_subject": str(raw_job.get("dual_save_subject", "")),
                 }
             )
         raw_status = str(payload.get("status", "paused"))

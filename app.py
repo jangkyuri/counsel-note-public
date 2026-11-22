@@ -92,6 +92,8 @@ from counsel_modules import openai_processing
 from counsel_modules.atomic_json import write_json_atomic
 from counsel_modules.docs_qa_auth import post_docs
 from counsel_modules.audio_workflow_ui import audio_workflow_counts, render_audio_processing_log, render_audio_workflow_overview
+from counsel_modules.dual_save import Lesson, Outcome
+from counsel_modules.dual_save_runtime import SaveResult, enabled as dual_save_enabled, save_on_server
 from counsel_modules.recording_backup_worker import (
     recording_backup_is_running, recording_backup_warning, request_recording_backup, retry_recording_backup,
     request_recording_cleanup,
@@ -9407,9 +9409,62 @@ def audio_batch_saved_student_count(state: AudioBatchState) -> int:
     return audio_workflow_counts(state).students
 
 
+def save_audio_batch_job_to_both(state: AudioBatchState, job: AudioBatchJob) -> None:
+    export_text, _ = admin_notes_export_text_from_summary(summary_text=job["summary"])
+    if not export_text or not summary_copy_save_allowed(job["summary"], SUMMARY_STATUS_READY):
+        return
+    job_id = job["job_id"]
+    sid = job.get("dual_save_sid", "")
+    previous = SaveResult(
+        Outcome.EXISTING if sid and job.get("admin_saved") else Outcome.PENDING,
+        Outcome.EXISTING if sid and job.get("docs_saved") else Outcome.PENDING,
+        sid, job.get("dual_save_doc_id", ""), job.get("dual_save_subject", ""),
+    )
+    docs_map = []
+    for row in load_google_docs_map_rows():
+        url_id = extract_google_docs_doc_id(row["doc_url"])
+        doc_id = row["doc_id"]
+        if row["doc_url"] and doc_id and url_id != doc_id:
+            docs_map.append((row["student_name"], ""))
+        docs_map.append((row["student_name"], doc_id or url_id))
+
+    def record_target(lesson: Lesson, doc_id: str) -> None:
+        job["dual_save_sid"] = lesson.sid
+        job["dual_save_doc_id"] = doc_id
+        job["dual_save_subject"] = lesson.subject
+        persist_audio_batch_session_state(state)
+
+    result = save_on_server(
+        job["student_name"], date.fromisoformat(job["counseling_date"]),
+        export_text, docs_map, previous, record_target,
+    )
+    admin_ok = result.admin.verified
+    docs_ok = result.docs.verified
+    status_label = {
+        Outcome.SAVED: "저장 확인", Outcome.EXISTING: "이미 저장됨",
+        Outcome.PENDING: "연결·저장 재확인 필요", Outcome.REVIEW: "대상·기존 기록 확인 필요",
+    }
+    saved = update_audio_batch_job(
+        state, job_id, status="completed" if admin_ok and docs_ok else "needs_review",
+        detail=f"ADMIN {status_label[result.admin]} · Docs {status_label[result.docs]}",
+        transcript_path=job["transcript_path"], summary=job["summary"], updated_at=audio_batch_now_iso(),
+    )
+    item = next(row for row in saved["jobs"] if row["job_id"] == job_id)
+    item["admin_saved"] = admin_ok
+    item["docs_saved"] = docs_ok
+    item["admin_sid"] = result.sid
+    if admin_ok:
+        item["admin_saved_export"] = export_text
+    persist_audio_batch_session_state(saved)
+
+
 def save_audio_batch_job_to_admin(job_id: str) -> None:
     state = st.session_state["audio_batch_state"]
     job = next(job for job in state["jobs"] if job["job_id"] == job_id)
+    if dual_save_enabled():
+        if not (job.get("dual_save_sid") and job.get("admin_saved") and job.get("docs_saved")):
+            save_audio_batch_job_to_both(state, job)
+        return
     if job.get("admin_saved"):
         return
     counseling_date = date.fromisoformat(job["counseling_date"])
@@ -9468,7 +9523,8 @@ def save_audio_batch_job_to_admin(job_id: str) -> None:
 def save_completed_audio_batch_summaries() -> None:
     state = st.session_state["audio_batch_state"]
     for job in state["jobs"]:
-        if job["summary"].strip() and job["status"] in {"completed", "needs_review"} and not job.get("admin_saved"):
+        incomplete = not job.get("admin_saved") or (dual_save_enabled() and not job.get("docs_saved"))
+        if job["summary"].strip() and job["status"] in {"completed", "needs_review"} and incomplete:
             save_audio_batch_job_to_admin(job["job_id"])
 
 
@@ -9510,7 +9566,8 @@ def finish_active_audio_batch_job(
             refresh_status()
         save_audio_batch_job_to_admin(job_id)
         saved_job = next(job for job in st.session_state["audio_batch_state"]["jobs"] if job["job_id"] == job_id)
-        set_progress("ADMIN 저장", "완료" if saved_job.get("admin_saved") else "보완 필요", saved_job["detail"])
+        stores_ok = bool(saved_job.get("admin_saved")) and (not dual_save_enabled() or bool(saved_job.get("docs_saved")))
+        set_progress("ADMIN 저장", "완료" if stores_ok else "보완 필요", saved_job["detail"])
     st.session_state["is_processing"] = False
     st.session_state["pending_main_run"] = False
     st.session_state["current_job_snapshot"] = None
@@ -9896,6 +9953,8 @@ def audio_batch_panel_expanded(state: AudioBatchState | None) -> bool:
 
 
 def render_audio_batch_admin_target(selected_job: AudioBatchJob) -> None:
+    if dual_save_enabled():
+        return
     if selected_job.get("admin_saved"):
         return
     job_id = selected_job["job_id"]
@@ -9949,15 +10008,21 @@ def render_audio_batch_controls(ui_locked: bool) -> None:
             resume_button_slot.info("처리를 시작했습니다.")
             persist_audio_batch_session_state(resume_audio_batch_state(state, audio_batch_now_iso()))
             start_next_audio_batch_job_with_refresh()
+    require_docs = dual_save_enabled()
+    def incomplete(job: AudioBatchJob) -> bool:
+        return not job.get("admin_saved") or (require_docs and not job.get("docs_saved"))
+
     problem_count = sum(job["status"] in {"failed", "needs_review"} or
-        (job["status"] == "completed" and not job.get("admin_saved")) for job in state["jobs"])
+        (job["status"] == "completed" and incomplete(job)) for job in state["jobs"])
     if problem_count:
         storage_only = all(summary_copy_save_allowed(job["summary"], SUMMARY_STATUS_READY)
-            for job in state["jobs"] if not job.get("admin_saved"))
+            for job in state["jobs"] if incomplete(job))
         if st.button(f"{'미저장 정리본 저장' if storage_only else '미완료 항목 다시 처리'} ({problem_count}건)",
             key="audio_batch_retry", disabled=ui_locked or state["status"] == "running" or counts["pending"] > 0,
             use_container_width=True):
-            persist_audio_batch_session_state(prepare_audio_batch_retry(state, audio_batch_now_iso()))
+            persist_audio_batch_session_state(prepare_audio_batch_retry(
+                state, audio_batch_now_iso(), require_docs=require_docs,
+            ))
             start_next_audio_batch_job_with_refresh()
 
 
