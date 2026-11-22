@@ -29,6 +29,9 @@ function doPost(e) {
     }
 
     const data = JSON.parse(e.postData.contents);
+    if (data.action === "clg8514-v1") {
+      return clg8514AppendRequest_(data);
+    }
     const docId = String(data.doc_id || "").trim();
     const studentName = String(data.student_name || "").trim();
     const counselingDate = String(data.counseling_date || "").trim();

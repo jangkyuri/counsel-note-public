@@ -51,5 +51,43 @@ uploads made before the replay database was introduced. Use a fresh synthetic
 recording once, then upload those identical bytes again to verify replay.
 Include `tests/test_recording_replay.py` in isolated QA.
 
+## Existing Apps Script transport (no new OAuth app)
+
+The opt-in `clg8514-v1` action is distinct from the existing app's save and
+verify actions. Keep the live script's existing version and behavior. Port only
+the dispatch hunk to the live script source after comparing the current
+deployment, and add `scripts/google_apps_script_8514_append.js` as a separate
+Apps Script source file. Do not replace the live script with this repository's
+older base copy. Verify the signed route on an isolated deployment before
+updating the existing production deployment in place. Never make a QA
+deployment of the unrestricted legacy save handler.
+
+* Script Properties: configure `CLG8514_APPEND_SECRET` (64 random lower-case hex
+  characters) and `CLG8514_APPEND_ALLOWED_DOC_IDS` (JSON string array of exact
+  document IDs). In QA, include only the dedicated synthetic Doc. Absent
+  properties reject the new action before opening any document.
+* 8514 only: set `CONNECT_LOG_DUAL_SAVE_APPS_SCRIPT_URL` to the corresponding
+  existing HTTPS Apps Script exec URL and
+  `CONNECT_LOG_DUAL_SAVE_APPS_SCRIPT_SECRET_FILE` to the protected file
+  containing the same secret. Keep the secret out of Git, URLs and logs.
+  This transport does not use `CONNECT_LOG_DUAL_SAVE_GOOGLE_CREDENTIALS`.
+  An incomplete Apps Script configuration does not fall back to the old writer.
+* Do not alter 8003. If allowed on this installation, permit only the existing
+  internal ADMIN endpoints and the configured Google Apps Script origin plus the
+  same Google Content Service response origin. Do not forward or replay a
+  signed POST to a redirect target.
+* Run `node scripts/check_google_apps_script_8514_append.js` and
+  `tests/test_dual_save_script.py`, plus the original script regression checks.
+  Use a brand-new synthetic record with existing progress and homework:
+  read, request append, read, repeat the request, and read again. Verify the
+  existing text and formatting and the new record count `0 -> 1 -> 1`.
+
+The new mode only appends paragraphs. It never calls the legacy replace-cell
+operation. It fails closed on an unknown year, subject or document name,
+multiple candidates, no safe empty row, or a known change to the target row.
+A follow-up read is required before completion. The Google Docs synthetic
+readback done through the connector checks the live document contents, but is
+not a test of the authorized Apps Script transport. Do not conflate the two.
+
 Google Docs write contract:
 https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/batchUpdate

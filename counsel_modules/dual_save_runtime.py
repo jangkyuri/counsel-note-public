@@ -6,13 +6,16 @@ import socket
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from pathlib import Path
 from typing import Protocol
+from urllib.parse import urlsplit
 
 from counsel_modules.dual_save import (
-    Lesson, Outcome, SaveReview, SaveUnavailable, Snapshot, canonical_subject, identity,
-    save_missing, select_lesson,
+    Lesson, Notes, Outcome, SaveReview, SaveUnavailable, Snapshot, TitleMismatch,
+    canonical_subject, identity, save_missing, select_lesson,
 )
 from counsel_modules.dual_save_docs import Json, JsonMap, document_snapshot, document_update, mapping, sequence
+from counsel_modules.dual_save_script import SCRIPT_EXEC_URL, SECRET, ScriptDocsNotes
 
 _ADMIN = "http://127.0.0.1:8003"
 _DOCS = "https://docs.googleapis.com/v1/documents/"
@@ -22,10 +25,6 @@ _SCOPE = "https://www.googleapis.com/auth/documents"
 class JsonClient(Protocol):
     def get(self, url: str, *, params: dict[str, str] | None = None) -> Json: ...
     def post(self, url: str, *, json: JsonMap) -> Json: ...
-
-
-class TitleMismatch(SaveReview):
-    """The matched document does not identify this student."""
 
 
 def enabled() -> bool:
@@ -129,6 +128,7 @@ def process_lesson(
     admin_client: JsonClient, docs_client: JsonClient, name: str, day: date, summary: str,
     docs_map: list[tuple[str, str]], previous: SaveResult,
     on_target: Callable[[Lesson, str], None] | None = None,
+    docs_factory: Callable[[JsonClient, Lesson, str], Notes] = DocsNotes,
 ) -> SaveResult:
     try:
         lesson = select_lesson(name, day, load_lessons(admin_client, day))
@@ -141,7 +141,7 @@ def process_lesson(
         return SaveResult(Outcome.REVIEW, Outcome.REVIEW, previous.sid, previous.doc_id, previous.subject)
     except SaveUnavailable:
         return previous
-    docs = DocsNotes(docs_client, lesson, doc)
+    docs = docs_factory(docs_client, lesson, doc)
     if not previous.docs.verified:
         try:
             docs.read()
@@ -173,20 +173,38 @@ def save_on_server(
     on_target: Callable[[Lesson, str], None],
 ) -> SaveResult:
     """Use a private ADMIN origin and the server's explicitly approved Google credential."""
-    credential_file = os.environ.get("CONNECT_LOG_DUAL_SAVE_GOOGLE_CREDENTIALS", "").strip()
-    if not enabled() or not credential_file:
+    if not enabled():
         return previous
+    script_url = os.environ.get("CONNECT_LOG_DUAL_SAVE_APPS_SCRIPT_URL", "").strip()
+    secret_file = os.environ.get("CONNECT_LOG_DUAL_SAVE_APPS_SCRIPT_SECRET_FILE", "").strip()
+    docs_factory: Callable[[JsonClient, Lesson, str], Notes] = DocsNotes
+    add_docs_auth: Callable[[str, str, dict[str, str]], None] | None = None
     try:
         import httpx2
-        from google.auth.exceptions import GoogleAuthError
-        from google.auth.transport.requests import Request
-        from google.oauth2.credentials import Credentials
     except ImportError:
         return previous
-    try:
-        credentials = Credentials.from_authorized_user_file(credential_file, scopes=[_SCOPE])
-    except (OSError, ValueError, GoogleAuthError):
-        return previous
+    if script_url or secret_file:
+        if not SCRIPT_EXEC_URL.fullmatch(script_url) or not secret_file:
+            return previous
+        try:
+            secret = Path(secret_file).read_text(encoding="ascii").strip()
+        except (OSError, ValueError):
+            return previous
+        if not SECRET.fullmatch(secret):
+            return previous
+
+        def script_notes(client: JsonClient, lesson: Lesson, doc_id: str) -> Notes:
+            return ScriptDocsNotes(client, lesson, doc_id, script_url, secret)
+
+        docs_factory = script_notes
+    else:
+        credential_file = os.environ.get("CONNECT_LOG_DUAL_SAVE_GOOGLE_CREDENTIALS", "").strip()
+        if not credential_file:
+            return previous
+        try:
+            add_docs_auth = _direct_docs_authorizer(credential_file)
+        except (ImportError, SaveUnavailable):
+            return previous
     limits = httpx2.Limits(max_connections=200, max_keepalive_connections=40, keepalive_expiry=30.0)
     timeout = httpx2.Timeout(connect=5.0, read=30.0, write=10.0, pool=10.0)
     sockets = [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
@@ -195,8 +213,20 @@ def save_on_server(
         def request(method: str, url: str, **kwargs: Json) -> Json:
             headers: dict[str, str] = {}
             try:
-                if url.startswith(_DOCS):
-                    credentials.before_request(Request(), method, url, headers)
+                if script_url and method == "POST" and url == script_url:
+                    response = client.request(method, url, headers=headers, **kwargs)
+                    if response.status_code in (302, 303):
+                        location = response.headers.get("Location", "")
+                        target = urlsplit(location)
+                        if (target.scheme, target.netloc, target.path) != (
+                            "https", "script.googleusercontent.com", "/macros/echo",
+                        ):
+                            raise SaveUnavailable()
+                        response = client.get(location)
+                    response.raise_for_status()
+                    return response.json()
+                if add_docs_auth is not None and url.startswith(_DOCS):
+                    add_docs_auth(method, url, headers)
                 elif not url.startswith(_ADMIN + "/api/"):
                     raise SaveUnavailable()
                 response = client.request(method, url, headers=headers, **kwargs)
@@ -204,8 +234,29 @@ def save_on_server(
                     raise SaveReview()
                 response.raise_for_status()
                 return response.json()
-            except (httpx2.HTTPError, GoogleAuthError, ValueError):
+            except (httpx2.HTTPError, ValueError):
                 raise SaveUnavailable() from None
 
         bridge = _Transport(request)
-        return process_lesson(bridge, bridge, name, day, summary, docs_map, previous, on_target)
+        return process_lesson(bridge, bridge, name, day, summary, docs_map, previous, on_target, docs_factory)
+
+
+def _direct_docs_authorizer(
+    credentials_path: str,
+) -> Callable[[str, str, dict[str, str]], None]:
+    from google.auth.exceptions import GoogleAuthError
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+
+    try:
+        credentials = Credentials.from_authorized_user_file(credentials_path, scopes=[_SCOPE])
+    except (OSError, ValueError, GoogleAuthError):
+        raise SaveUnavailable() from None
+
+    def add_auth(method: str, url: str, headers: dict[str, str]) -> None:
+        try:
+            credentials.before_request(Request(), method, url, headers)
+        except GoogleAuthError:
+            raise SaveUnavailable() from None
+
+    return add_auth

@@ -28,6 +28,10 @@ class SaveReview(RuntimeError):
     """The destination or existing record is ambiguous."""
 
 
+class TitleMismatch(SaveReview):
+    """The matched document does not identify this student."""
+
+
 @dataclass(frozen=True, slots=True)
 class Lesson:
     sid: str
